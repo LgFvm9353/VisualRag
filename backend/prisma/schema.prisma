@@ -1,0 +1,81 @@
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  extensions = [vector]
+}
+
+model Document {
+  id        String        @id @default(uuid())
+  userId    String
+  fileName  String
+  createdAt DateTime      @default(now())
+
+  pages     Page[]
+  textPages TextPage[]
+  regions   VisualRegion[]
+  embeddings TextEmbedding[]
+}
+
+model Page {
+  id         String   @id @default(uuid())
+  document   Document @relation(fields: [documentId], references: [id])
+  documentId String
+  pageNumber Int
+  width      Float
+  height     Float
+}
+
+model TextPage {
+  id         String   @id @default(uuid())
+  document   Document @relation(fields: [documentId], references: [id])
+  documentId String
+  pageNumber Int
+  text       String
+
+  embeddings TextEmbedding[]
+}
+
+model VisualRegion {
+  id         String   @id @default(uuid())
+  document   Document @relation(fields: [documentId], references: [id])
+  documentId String
+  pageNumber Int
+  type       String
+  x0         Float
+  y0         Float
+  x1         Float
+  y1         Float
+  imageEmbeddings ImageEmbedding[]
+}
+
+model TextEmbedding {
+  id          String   @id @default(uuid())
+  document    Document @relation(fields: [documentId], references: [id])
+  documentId  String
+  textPage    TextPage @relation(fields: [textPageId], references: [id])
+  textPageId  String
+  content     String
+  embedding   Unsupported("vector(256)")
+  createdAt   DateTime @default(now())
+
+  @@index([documentId])
+  @@index([textPageId])
+}
+
+model ImageEmbedding {
+  id          String       @id @default(uuid())
+  document    Document     @relation(fields: [documentId], references: [id])
+  documentId  String
+  region      VisualRegion @relation(fields: [regionId], references: [id])
+  regionId    String
+  embedding   Unsupported("vector(256)")
+  createdAt   DateTime     @default(now())
+
+  @@index([documentId])
+  @@index([regionId])
+}
