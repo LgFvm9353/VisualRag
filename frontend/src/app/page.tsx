@@ -10,7 +10,6 @@ import {
   GlobalWorkerOptions,
   type PDFDocumentProxy,
 } from "pdfjs-dist";
-import { FixedSizeList, type ListChildComponentProps } from "react-window";
 
 interface IngestionProgressEvent {
   taskId: string;
@@ -257,7 +256,6 @@ export default function HomePage() {
   const [viewerDocumentId, setViewerDocumentId] = useState<string | null>(null);
   const [pdfUrl, setPdfUrl] = useState<string | null>(null);
   const pdfDocRef = useRef<PDFDocumentProxy | null>(null);
-  const [fakeRefIndex, setFakeRefIndex] = useState(0);
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResults, setSearchResults] = useState<SearchResultItem[]>([]);
   const [searching, setSearching] = useState(false);
@@ -265,7 +263,9 @@ export default function HomePage() {
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [chatStreaming, setChatStreaming] = useState(false);
   const [chatError, setChatError] = useState<string | null>(null);
-  const chatListRef = useRef<FixedSizeList | null>(null);
+  const [uploadError, setUploadError] = useState<string | null>(null);
+  const [searchError, setSearchError] = useState<string | null>(null);
+  const chatListRef = useRef<HTMLDivElement | null>(null);
   const [speechSupported, setSpeechSupported] = useState(false);
   const [recognizing, setRecognizing] = useState(false);
   const recognitionRef = useRef<any | null>(null);
@@ -424,6 +424,7 @@ export default function HomePage() {
   const handleUpload = async (file: File) => {
     setUploading(true);
     setProgress(null);
+    setUploadError(null);
     try {
       const taskId = await uploadFileWithResume(file);
       setCurrentTaskId(taskId);
@@ -435,23 +436,14 @@ export default function HomePage() {
       }
     } catch (error) {
       console.error("Upload error", error);
+      const message =
+        error instanceof Error && error.message
+          ? error.message
+          : "上传失败，请检查网络或后端服务。";
+      setUploadError(message);
     } finally {
       setUploading(false);
     }
-  };
-
-  const onFakeReferenceClick = () => {
-    if (!viewerDocumentId || pages.length === 0) return;
-    const firstPageNumber = pages[0]?.pageNumber;
-    const firstRegions = regionsByPage[firstPageNumber];
-    if (!firstRegions || firstRegions.length === 0) return;
-    const region = firstRegions[fakeRefIndex % firstRegions.length];
-    setFakeRefIndex((v) => v + 1);
-    setActiveReference({
-      documentId: viewerDocumentId,
-      pageNumber: firstPageNumber,
-      regionIds: [region.id],
-      });
   };
 
   const handleChatSubmit = () => {
@@ -611,21 +603,29 @@ export default function HomePage() {
   };
 
   useEffect(() => {
-    if (!chatListRef.current) return;
+    const el = chatListRef.current;
+    if (!el) return;
     if (chatMessages.length === 0) return;
-    chatListRef.current.scrollToItem(chatMessages.length - 1);
+    el.scrollTop = el.scrollHeight;
   }, [chatMessages.length]);
 
   const handleSearch = async () => {
     if (!viewerDocumentId) return;
     if (!searchQuery.trim()) return;
     setSearching(true);
+    setSearchError(null);
     try {
       const params = new URLSearchParams({ q: searchQuery.trim() });
       const res = await fetch(
         `${backendUrl}/documents/${viewerDocumentId}/search/semantic?${params.toString()}`
       );
       if (!res.ok) {
+        const message =
+          res.status === 404
+            ? "未找到搜索结果，请确认文档是否已完成处理。"
+            : "搜索失败，请稍后重试或检查后端服务。";
+        setSearchResults([]);
+        setSearchError(message);
         return;
       }
       const data = (await res.json()) as SearchResponse;
@@ -638,6 +638,10 @@ export default function HomePage() {
           regionIds: first.regionIds,
         });
       }
+    } catch (error) {
+      console.error("Search error", error);
+      setSearchResults([]);
+      setSearchError("搜索请求异常，请检查网络连接或后端服务。");
     } finally {
       setSearching(false);
     }
@@ -722,7 +726,7 @@ export default function HomePage() {
         }}
         disabled={uploading}
       />
-      <section className="scrollbar-hide relative z-20 flex w-full flex-shrink-0 flex-col gap-5 overflow-y-auto border-r border-slate-200 bg-white p-6 shadow-[4px_0_24px_-12px_rgba(0,0,0,0.05)] lg:w-[420px] xl:w-[460px]">
+      <section className="relative z-20 flex w-full flex-shrink-0 flex-col gap-5 border-r border-slate-200 bg-white p-6 shadow-[4px_0_24px_-12px_rgba(0,0,0,0.05)] lg:w-[420px] xl:w-[460px]">
         <div className="flex items-center justify-between pb-2">
           <h1 className="text-xl font-bold tracking-tight text-slate-900">
             VisualRAG <span className="text-indigo-600">Insight</span>
@@ -772,6 +776,11 @@ export default function HomePage() {
             </button>
             <p className="text-xs text-slate-500">或将 PDF 文件拖拽至此处</p>
           </div>
+          {uploadError && (
+            <div className="mt-2 rounded-xl border border-red-100 bg-red-50 px-3 py-2 text-xs text-red-600">
+              {uploadError}
+            </div>
+          )}
         </div>
 
         <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
@@ -838,6 +847,11 @@ export default function HomePage() {
               )}
             </button>
           </div>
+          {searchError && (
+            <div className="mb-2 rounded-xl border border-red-100 bg-red-50 px-3 py-2 text-xs text-red-600">
+              {searchError}
+            </div>
+          )}
           <div className="max-h-48 space-y-2 overflow-y-auto pr-1 scrollbar-thin scrollbar-thumb-slate-200">
             {searchResults.length === 0 ? (
               <p className="py-2 text-center text-xs text-slate-400">
@@ -874,7 +888,7 @@ export default function HomePage() {
           </div>
         </div>
 
-        <div className="flex min-h-[400px] flex-1 flex-col rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+        <div className="flex flex-col rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
           <div className="mb-3 flex items-center justify-between">
              <div className="text-sm font-semibold text-slate-900">
               AI 助手
@@ -886,7 +900,7 @@ export default function HomePage() {
             )}
           </div>
           
-          <div className="flex-1 overflow-hidden rounded-xl bg-slate-50/50 border border-slate-100 mb-4 relative">
+          <div className="overflow-hidden rounded-xl bg-slate-50/50 border border-slate-100 mb-4 relative">
              {chatMessages.length === 0 ? (
                 <div className="absolute inset-0 flex flex-col items-center justify-center p-6 text-center text-slate-400">
                   <svg className="mb-3 h-10 w-10 text-slate-300" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -895,22 +909,21 @@ export default function HomePage() {
                   <p className="text-sm">Ready to chat about your document.</p>
                 </div>
               ) : (
-                <FixedSizeList
+                <div
                   ref={chatListRef}
-                  height={400}
-                  width="100%"
-                  itemCount={chatMessages.length}
-                  itemSize={120}
-                  className="scrollbar-thin scrollbar-thumb-slate-200"
+                  className="h-64 w-full overflow-y-auto scrollbar-thin scrollbar-thumb-slate-200 px-4 py-2"
                 >
-                  {({ index, style }: ListChildComponentProps) => {
-                    const m = chatMessages[index];
+                  {chatMessages.map((m) => {
                     const hasCitations = m.citations && m.citations.length > 0;
                     const isUser = m.role === "user";
                     return (
-                      <div style={style} className="px-4 py-2">
-                        <div className={`flex flex-col ${isUser ? 'items-end' : 'items-start'}`}>
-                          <div className={`mb-1 text-[10px] font-medium uppercase tracking-wider ${isUser ? 'text-slate-400' : 'text-indigo-500'}`}>
+                      <div key={m.id} className="mb-2">
+                        <div className={`flex flex-col ${isUser ? "items-end" : "items-start"}`}>
+                          <div
+                            className={`mb-1 text-[10px] font-medium uppercase tracking-wider ${
+                              isUser ? "text-slate-400" : "text-indigo-500"
+                            }`}
+                          >
                             {isUser ? "You" : "Assistant"}
                           </div>
                           <div
@@ -924,32 +937,32 @@ export default function HomePage() {
                               {m.content}
                             </div>
                             {!isUser && hasCitations && viewerDocumentId && (
-                                <div className="mt-3 flex flex-wrap gap-1.5 pt-2 border-t border-slate-100">
-                                  {m.citations!.map((c, idx) => (
-                                    <button
-                                      key={`${m.id}-c-${idx}`}
-                                      type="button"
-                                      onClick={() => {
-                                        setActiveReference({
-                                          documentId: viewerDocumentId,
-                                          pageNumber: c.pageNumber,
-                                          regionIds: c.regionIds,
-                                        });
-                                      }}
-                                      className="inline-flex items-center gap-1 rounded-md bg-indigo-50 px-2 py-1 text-[10px] font-medium text-indigo-700 hover:bg-indigo-100 hover:text-indigo-800 transition-colors"
-                                    >
-                                      <span className="opacity-50">P.{c.pageNumber}</span>
-                                      <span>Area {c.regionIds.length}</span>
-                                    </button>
-                                  ))}
-                                </div>
-                              )}
+                              <div className="mt-3 flex flex-wrap gap-1.5 pt-2 border-t border-slate-100">
+                                {m.citations!.map((c, idx) => (
+                                  <button
+                                    key={`${m.id}-c-${idx}`}
+                                    type="button"
+                                    onClick={() => {
+                                      setActiveReference({
+                                        documentId: viewerDocumentId,
+                                        pageNumber: c.pageNumber,
+                                        regionIds: c.regionIds,
+                                      });
+                                    }}
+                                    className="inline-flex items-center gap-1 rounded-md bg-indigo-50 px-2 py-1 text-[10px] font-medium text-indigo-700 hover:bg-indigo-100 hover:text-indigo-800 transition-colors"
+                                  >
+                                    <span className="opacity-50">P.{c.pageNumber}</span>
+                                    <span>Area {c.regionIds.length}</span>
+                                  </button>
+                                ))}
+                              </div>
+                            )}
                           </div>
                         </div>
                       </div>
                     );
-                  }}
-                </FixedSizeList>
+                  })}
+                </div>
               )}
           </div>
 
@@ -1007,14 +1020,6 @@ export default function HomePage() {
                 </svg>
             </button>
           </div>
-           {/* Demo Button */}
-          <button
-            type="button"
-            onClick={onFakeReferenceClick}
-            className="mt-4 w-full rounded-lg border border-indigo-100 bg-indigo-50/50 py-2 text-xs font-medium text-indigo-600 transition-colors hover:bg-indigo-50"
-          >
-            Demo: Highlight Random Reference
-          </button>
         </div>
       </section>
 

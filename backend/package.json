@@ -8,10 +8,6 @@
     "start": "node dist/server.js",
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test:ingestion": "tsx src/ingestionSmokeTest.ts",
-    "test:chat-stream": "tsx src/chatStreamCorsTest.ts",
-    "test:chat-model": "tsx src/chatModelSmokeTest.ts",
-    "test:health": "tsx src/healthTest.ts",
     "prisma:generate": "prisma generate"
   },
   "dependencies": {

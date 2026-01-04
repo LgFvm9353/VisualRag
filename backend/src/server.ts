@@ -76,6 +76,31 @@ type UploadIndexEntry = {
 
 type UploadIndex = Record<string, UploadIndexEntry>;
 
+function getAllowedOrigins() {
+  const value = process.env.FRONTEND_ORIGIN;
+  if (!value) {
+    return ["*"];
+  }
+  return value
+    .split(",")
+    .map((v) => v.trim())
+    .filter((v) => v.length > 0);
+}
+
+function resolveAllowedOrigin(origin: string | undefined) {
+  const allowed = getAllowedOrigins();
+  if (allowed.includes("*")) {
+    return origin || "*";
+  }
+  if (!origin) {
+    return undefined;
+  }
+  if (allowed.includes(origin)) {
+    return origin;
+  }
+  return undefined;
+}
+
 function getUploadsDir() {
   return join(process.cwd(), "uploads");
 }
@@ -135,6 +160,42 @@ async function saveUploadMetadata(meta: UploadMetadata): Promise<void> {
   const path = getUploadMetadataPath(rootDir, meta.id);
   const json = JSON.stringify(meta);
   await fs.writeFile(path, json, "utf8");
+}
+
+async function cleanupStaleUploads(maxAgeMs = 24 * 60 * 60 * 1000) {
+  const rootDir = getChunksRootDir();
+  let entries: string[];
+  try {
+    entries = await fs.readdir(rootDir);
+  } catch (err: any) {
+    if (err && err.code === "ENOENT") {
+      return;
+    }
+    throw err;
+  }
+  const now = Date.now();
+  for (const entry of entries) {
+    if (!entry.endsWith(".json")) {
+      continue;
+    }
+    const id = entry.slice(0, -5);
+    const meta = await loadUploadMetadata(id);
+    if (!meta) {
+      continue;
+    }
+    const created = Date.parse(meta.createdAt);
+    if (Number.isNaN(created)) {
+      continue;
+    }
+    if (now - created < maxAgeMs) {
+      continue;
+    }
+    const metadataPath = getUploadMetadataPath(rootDir, meta.id);
+    await fs.rm(meta.tempDir, { recursive: true, force: true }).catch(
+      () => {}
+    );
+    await fs.unlink(metadataPath).catch(() => {});
+  }
 }
 
 const app = fastify({ logger: true });
@@ -345,15 +406,39 @@ async function semanticSearch(
 }
 
 app.register(cors, {
-  origin: "*",
+  origin(origin, cb) {
+    if (!origin) {
+      cb(null, true);
+      return;
+    }
+    const resolved = resolveAllowedOrigin(origin);
+    if (!resolved) {
+      cb(new Error("Origin not allowed"), false);
+      return;
+    }
+    cb(null, true);
+  },
   methods: ["GET", "POST", "PUT", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "x-user-id"],
+  credentials: !getAllowedOrigins().includes("*"),
 });
 
 app.register(multipart);
 
 const io = new SocketIOServer(app.server, {
   cors: {
-    origin: "*",
+    origin(origin, callback) {
+      if (!origin) {
+        callback(null, true);
+        return;
+      }
+      const resolved = resolveAllowedOrigin(origin);
+      if (!resolved) {
+        callback(new Error("Origin not allowed"), false as any);
+        return;
+      }
+      callback(null, true);
+    },
   },
 });
 
@@ -722,13 +807,23 @@ app.get("/chat/stream", async (request, reply) => {
     q: (request.query as any).q,
     limit: (request.query as any).limit,
   });
-  const originHeader = (request.headers.origin as string) || "*";
+  const originHeader = resolveAllowedOrigin(
+    request.headers.origin as string | undefined
+  );
+  if (!originHeader) {
+    reply.code(403).send({ error: "origin_not_allowed" });
+    return;
+  }
+  const req = request.raw;
+  let closed = false;
+  req.on("close", () => {
+    closed = true;
+  });
   reply.raw.writeHead(200, {
     "Content-Type": "text/event-stream",
     "Cache-Control": "no-cache",
     Connection: "keep-alive",
     "Access-Control-Allow-Origin": originHeader,
-    "Access-Control-Allow-Credentials": "true",
   });
   reply.raw.flushHeaders?.();
   try {
@@ -754,6 +849,9 @@ app.get("/chat/stream", async (request, reply) => {
     ].join("\n");
     const stream = await chatLlm.stream(prompt);
     for await (const chunk of stream) {
+      if (closed) {
+        break;
+      }
       const content = chunk.content;
       const token =
         typeof content === "string"
@@ -765,6 +863,9 @@ app.get("/chat/stream", async (request, reply) => {
         const payload = JSON.stringify({ type: "token", token });
         reply.raw.write(`data: ${payload}\n\n`);
       }
+    }
+    if (closed) {
+      return reply;
     }
     const citations = results.map((r) => ({
       pageNumber: r.pageNumber,
@@ -780,9 +881,11 @@ app.get("/chat/stream", async (request, reply) => {
       err?.response?.data?.message ||
       err?.message ||
       "unknown_error";
-    const payload = JSON.stringify({ type: "error", message });
-    reply.raw.write(`data: ${payload}\n\n`);
-    reply.raw.end();
+    if (!reply.raw.writableEnded) {
+      const payload = JSON.stringify({ type: "error", message });
+      reply.raw.write(`data: ${payload}\n\n`);
+      reply.raw.end();
+    }
   }
   return reply;
 });
@@ -807,6 +910,7 @@ const port = Number(process.env.PORT) || 4000;
 
 const start = async () => {
   try {
+    void cleanupStaleUploads();
     await app.listen({ port, host: "0.0.0.0" });
     console.log(`VisualRAG Insight backend running on http://localhost:${port}`);
   } catch (err) {
