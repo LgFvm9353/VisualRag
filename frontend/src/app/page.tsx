@@ -109,7 +109,143 @@ interface ChatEventPayload {
   message?: string;
 }
 
-const backendUrl = "http://localhost:4000";
+interface UploadInitResponseFast {
+  fast: true;
+  taskId: string;
+}
+
+interface UploadInitResponseNormal {
+  fast: false;
+  uploadId: string;
+  uploadedChunks: number[];
+  chunkSize: number;
+  totalChunks: number;
+}
+
+type UploadInitResponse = UploadInitResponseFast | UploadInitResponseNormal;
+
+const backendUrl =
+  process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:4000";
+
+async function computeFileHash(file: File): Promise<string | null> {
+  const w = globalThis as any;
+  const subtle = w.crypto?.subtle;
+  if (!subtle) {
+    return null;
+  }
+  const buffer = await file.arrayBuffer();
+  const digest = await subtle.digest("SHA-256", buffer);
+  const bytes = new Uint8Array(digest);
+  const parts: string[] = [];
+  for (let i = 0; i < bytes.length; i++) {
+    parts.push(bytes[i].toString(16).padStart(2, "0"));
+  }
+  return parts.join("");
+}
+
+async function uploadFileLegacy(file: File): Promise<string> {
+  const formData = new FormData();
+  formData.append("file", file);
+  const res = await fetch(`${backendUrl}/upload`, {
+    method: "POST",
+    body: formData,
+  });
+  if (!res.ok) {
+    throw new Error("upload_failed");
+  }
+  const data = (await res.json()) as UploadResponse;
+  return data.taskId;
+}
+
+async function uploadFileWithResume(file: File): Promise<string> {
+  const hash = await computeFileHash(file);
+  if (!hash) {
+    return uploadFileLegacy(file);
+  }
+  const storageKey = `visualrag_upload_${hash}`;
+  let existingUploadId: string | undefined;
+  try {
+    const stored = globalThis.localStorage?.getItem(storageKey);
+    if (stored) {
+      const parsed = JSON.parse(stored) as { uploadId?: string };
+      if (parsed.uploadId) {
+        existingUploadId = parsed.uploadId;
+      }
+    }
+  } catch {
+  }
+  const defaultChunkSize = 5 * 1024 * 1024;
+  const initRes = await fetch(`${backendUrl}/upload/init`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      fileName: file.name,
+      fileSize: file.size,
+      hash,
+      chunkSize: defaultChunkSize,
+      existingUploadId,
+    }),
+  });
+  if (!initRes.ok) {
+    return uploadFileLegacy(file);
+  }
+  const initData = (await initRes.json()) as UploadInitResponse;
+  if (initData.fast) {
+    return initData.taskId;
+  }
+  const uploadId = initData.uploadId;
+  try {
+    globalThis.localStorage?.setItem(
+      storageKey,
+      JSON.stringify({ uploadId })
+    );
+  } catch {
+  }
+  const uploadedSet = new Set(initData.uploadedChunks);
+  const totalChunks = initData.totalChunks;
+  const chunkSize = initData.chunkSize || defaultChunkSize;
+  for (let index = 0; index < totalChunks; index++) {
+    if (uploadedSet.has(index)) {
+      continue;
+    }
+    const start = index * chunkSize;
+    const end = Math.min(file.size, start + chunkSize);
+    const chunk = file.slice(start, end);
+    const res = await fetch(
+      `${backendUrl}/upload/chunk?uploadId=${encodeURIComponent(
+        uploadId
+      )}&index=${index}`,
+      {
+        method: "PUT",
+        headers: {
+          "Content-Type": "application/octet-stream",
+        },
+        body: chunk,
+      }
+    );
+    if (!res.ok) {
+      throw new Error("upload_chunk_failed");
+    }
+  }
+  const completeRes = await fetch(`${backendUrl}/upload/complete`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ uploadId }),
+  });
+  if (!completeRes.ok) {
+    throw new Error("upload_complete_failed");
+  }
+  const completeData = (await completeRes.json()) as UploadResponse;
+  try {
+    globalThis.localStorage?.removeItem(storageKey);
+  } catch {
+  }
+  return completeData.taskId;
+}
 
 export default function HomePage() {
   const [socket, setSocket] = useState<Socket | null>(null);
@@ -289,23 +425,13 @@ export default function HomePage() {
     setUploading(true);
     setProgress(null);
     try {
-      const formData = new FormData();
-      formData.append("file", file);
-      const res = await fetch(`${backendUrl}/upload`, {
-        method: "POST",
-        body: formData,
-      });
-      if (!res.ok) {
-        console.error("Upload failed", res.status, res.statusText);
-        return;
-      }
-      const data = (await res.json()) as UploadResponse;
-      setCurrentTaskId(data.taskId);
-      setViewerDocumentId(data.taskId);
-      setPdfUrl(`${backendUrl}/files/${data.taskId}`);
+      const taskId = await uploadFileWithResume(file);
+      setCurrentTaskId(taskId);
+      setViewerDocumentId(taskId);
+      setPdfUrl(`${backendUrl}/files/${taskId}`);
       setSearchResults([]);
       if (socket) {
-        socket.emit("join-task", data.taskId);
+        socket.emit("join-task", taskId);
       }
     } catch (error) {
       console.error("Upload error", error);

@@ -6,6 +6,7 @@ import { z } from "zod";
 import { createWriteStream, createReadStream, promises as fs } from "fs";
 import { join } from "path";
 import { pipeline as streamPipeline } from "stream/promises";
+import { randomUUID, createHash } from "crypto";
 import { IngestionPipeline } from "./pipeline/ingestionPipeline.js";
 import { ProgressEmitter } from "./pipeline/progressEmitter.js";
 import { prisma } from "./db/prisma.js";
@@ -57,7 +58,93 @@ interface SemanticSearchResultItem {
   regionIds: string[];
 }
 
+interface UploadMetadata {
+  id: string;
+  fileName: string;
+  fileSize: number;
+  hash: string;
+  chunkSize: number;
+  totalChunks: number;
+  receivedChunks: number[];
+  tempDir: string;
+  createdAt: string;
+}
+
+type UploadIndexEntry = {
+  sourcePath: string;
+};
+
+type UploadIndex = Record<string, UploadIndexEntry>;
+
+function getUploadsDir() {
+  return join(process.cwd(), "uploads");
+}
+
+function getChunksRootDir() {
+  return join(getUploadsDir(), "chunks");
+}
+
+function getUploadMetadataPath(rootDir: string, id: string) {
+  return join(rootDir, `${id}.json`);
+}
+
+async function loadUploadIndex(): Promise<UploadIndex> {
+  const uploadsDir = getUploadsDir();
+  const indexPath = join(uploadsDir, "upload-index.json");
+  try {
+    const data = await fs.readFile(indexPath, "utf8");
+    const parsed = JSON.parse(data) as UploadIndex;
+    return parsed;
+  } catch (err: any) {
+    if (err && err.code === "ENOENT") {
+      return {};
+    }
+    throw err;
+  }
+}
+
+async function saveUploadIndex(index: UploadIndex): Promise<void> {
+  const uploadsDir = getUploadsDir();
+  const indexPath = join(uploadsDir, "upload-index.json");
+  const json = JSON.stringify(index);
+  await fs.mkdir(uploadsDir, { recursive: true });
+  await fs.writeFile(indexPath, json, "utf8");
+}
+
+async function loadUploadMetadata(
+  id: string
+): Promise<UploadMetadata | null> {
+  const rootDir = getChunksRootDir();
+  const path = getUploadMetadataPath(rootDir, id);
+  try {
+    const data = await fs.readFile(path, "utf8");
+    const parsed = JSON.parse(data) as UploadMetadata;
+    return parsed;
+  } catch (err: any) {
+    if (err && err.code === "ENOENT") {
+      return null;
+    }
+    throw err;
+  }
+}
+
+async function saveUploadMetadata(meta: UploadMetadata): Promise<void> {
+  const rootDir = getChunksRootDir();
+  await fs.mkdir(rootDir, { recursive: true });
+  await fs.mkdir(meta.tempDir, { recursive: true });
+  const path = getUploadMetadataPath(rootDir, meta.id);
+  const json = JSON.stringify(meta);
+  await fs.writeFile(path, json, "utf8");
+}
+
 const app = fastify({ logger: true });
+
+app.addContentTypeParser(
+  "application/octet-stream",
+  (_request, payload, done) => {
+    done(null, payload);
+  }
+);
 
 const openai = new OpenAI({
   baseURL: process.env.OPENAI_BASE_URL,
@@ -259,7 +346,7 @@ async function semanticSearch(
 
 app.register(cors, {
   origin: "*",
-  methods: ["GET", "POST", "OPTIONS"],
+  methods: ["GET", "POST", "PUT", "OPTIONS"],
 });
 
 app.register(multipart);
@@ -272,6 +359,145 @@ const io = new SocketIOServer(app.server, {
 
 const progressEmitter = new ProgressEmitter(io);
 const pipeline = new IngestionPipeline(progressEmitter);
+
+app.post("/upload/init", async (request, reply) => {
+  const schema = z.object({
+    fileName: z.string().min(1),
+    fileSize: z.number().int().min(1),
+    hash: z.string().min(1),
+    chunkSize: z.number().int().min(1),
+    existingUploadId: z.string().uuid().optional(),
+  });
+  const body = schema.parse(request.body);
+  const uploadsDir = getUploadsDir();
+  const chunksRootDir = getChunksRootDir();
+  await fs.mkdir(uploadsDir, { recursive: true });
+  await fs.mkdir(chunksRootDir, { recursive: true });
+  const index = await loadUploadIndex();
+  const existing = index[body.hash];
+  if (existing && existing.sourcePath) {
+    const userId = (request.headers["x-user-id"] as string) || "anonymous";
+    const task = pipeline.createTask({
+      userId,
+      fileName: body.fileName,
+      fileType: "pdf",
+      sourcePath: existing.sourcePath,
+    });
+    reply.send({ fast: true, taskId: task.id });
+    return;
+  }
+  let uploadId = body.existingUploadId;
+  let metadata: UploadMetadata | null = null;
+  if (uploadId) {
+    metadata = await loadUploadMetadata(uploadId);
+  }
+  if (!metadata) {
+    const totalChunks = Math.ceil(body.fileSize / body.chunkSize);
+    const tempDir = join(chunksRootDir, randomUUID());
+    uploadId = randomUUID();
+    metadata = {
+      id: uploadId,
+      fileName: body.fileName,
+      fileSize: body.fileSize,
+      hash: body.hash,
+      chunkSize: body.chunkSize,
+      totalChunks,
+      receivedChunks: [],
+      tempDir,
+      createdAt: new Date().toISOString(),
+    };
+    await saveUploadMetadata(metadata);
+  }
+  reply.send({
+    fast: false,
+    uploadId: metadata.id,
+    uploadedChunks: metadata.receivedChunks,
+    chunkSize: metadata.chunkSize,
+    totalChunks: metadata.totalChunks,
+  });
+});
+
+app.put("/upload/chunk", async (request, reply) => {
+  const schema = z.object({
+    uploadId: z.string().uuid(),
+    index: z.coerce.number().int().min(0),
+  });
+  const params = schema.parse(request.query as any);
+  const metadata = await loadUploadMetadata(params.uploadId);
+  if (!metadata) {
+    reply.code(404).send({ error: "upload_not_found" });
+    return;
+  }
+  if (params.index >= metadata.totalChunks) {
+    reply.code(400).send({ error: "invalid_chunk_index" });
+    return;
+  }
+  await fs.mkdir(metadata.tempDir, { recursive: true });
+  const chunkPath = join(metadata.tempDir, `${params.index}.part`);
+  const writeStream = createWriteStream(chunkPath);
+  try {
+    const payload = request.body as any;
+    await streamPipeline(payload, writeStream);
+  } catch (err) {
+    await fs.unlink(chunkPath).catch(() => {});
+    throw err;
+  }
+  if (!metadata.receivedChunks.includes(params.index)) {
+    metadata.receivedChunks.push(params.index);
+    metadata.receivedChunks.sort((a, b) => a - b);
+    await saveUploadMetadata(metadata);
+  }
+  reply.send({ ok: true });
+});
+
+app.post("/upload/complete", async (request, reply) => {
+  const schema = z.object({
+    uploadId: z.string().uuid(),
+  });
+  const body = schema.parse(request.body);
+  const uploadsDir = getUploadsDir();
+  const chunksRootDir = getChunksRootDir();
+  const metadata = await loadUploadMetadata(body.uploadId);
+  if (!metadata) {
+    reply.code(404).send({ error: "upload_not_found" });
+    return;
+  }
+  if (metadata.receivedChunks.length !== metadata.totalChunks) {
+    reply.code(400).send({ error: "chunks_incomplete" });
+    return;
+  }
+  await fs.mkdir(uploadsDir, { recursive: true });
+  const finalPath = join(uploadsDir, `${Date.now()}-${metadata.fileName}`);
+  const hash = createHash("sha256");
+  for (let index = 0; index < metadata.totalChunks; index++) {
+    const chunkPath = join(metadata.tempDir, `${index}.part`);
+    const data = await fs.readFile(chunkPath);
+    hash.update(data);
+    await fs.appendFile(finalPath, data);
+  }
+  const digest = hash.digest("hex");
+  if (digest !== metadata.hash) {
+    await fs.unlink(finalPath).catch(() => {});
+    reply.code(400).send({ error: "hash_mismatch" });
+    return;
+  }
+  const index = await loadUploadIndex();
+  index[metadata.hash] = { sourcePath: finalPath };
+  await saveUploadIndex(index);
+  const userId = (request.headers["x-user-id"] as string) || "anonymous";
+  const task = pipeline.createTask({
+    userId,
+    fileName: metadata.fileName,
+    fileType: "pdf",
+    sourcePath: finalPath,
+  });
+  const metadataPath = getUploadMetadataPath(chunksRootDir, metadata.id);
+  await fs.rm(metadata.tempDir, { recursive: true, force: true }).catch(
+    () => {}
+  );
+  await fs.unlink(metadataPath).catch(() => {});
+  reply.send({ taskId: task.id });
+});
 
 app.post("/upload", async (request, reply) => {
   try {
