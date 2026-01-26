@@ -159,7 +159,31 @@ async function saveUploadMetadata(meta: UploadMetadata): Promise<void> {
   await fs.mkdir(meta.tempDir, { recursive: true });
   const path = getUploadMetadataPath(rootDir, meta.id);
   const json = JSON.stringify(meta);
-  await fs.writeFile(path, json, "utf8");
+  const tmpPath = `${path}.tmp-${randomUUID()}`;
+  await fs.writeFile(tmpPath, json, "utf8");
+  await fs.unlink(path).catch(() => {});
+  await fs.rename(tmpPath, path);
+}
+
+const uploadLocks = new Map<string, Promise<void>>();
+
+async function withUploadLock<T>(uploadId: string, run: () => Promise<T>) {
+  const prev = uploadLocks.get(uploadId) ?? Promise.resolve();
+  let release!: () => void;
+  const next = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const tail = prev.then(() => next);
+  uploadLocks.set(uploadId, tail);
+  await prev;
+  try {
+    return await run();
+  } finally {
+    release();
+    if (uploadLocks.get(uploadId) === tail) {
+      uploadLocks.delete(uploadId);
+    }
+  }
 }
 
 async function cleanupStaleUploads(maxAgeMs = 24 * 60 * 60 * 1000) {
@@ -474,7 +498,10 @@ app.post("/upload/init", async (request, reply) => {
   let uploadId = body.existingUploadId;
   let metadata: UploadMetadata | null = null;
   if (uploadId) {
-    metadata = await loadUploadMetadata(uploadId);
+    const existingUploadId = uploadId;
+    metadata = await withUploadLock(existingUploadId, () =>
+      loadUploadMetadata(existingUploadId)
+    );
   }
   if (!metadata) {
     const totalChunks = Math.ceil(body.fileSize / body.chunkSize);
@@ -508,7 +535,9 @@ app.put("/upload/chunk", async (request, reply) => {
     index: z.coerce.number().int().min(0),
   });
   const params = schema.parse(request.query as any);
-  const metadata = await loadUploadMetadata(params.uploadId);
+  const metadata = await withUploadLock(params.uploadId, () =>
+    loadUploadMetadata(params.uploadId)
+  );
   if (!metadata) {
     reply.code(404).send({ error: "upload_not_found" });
     return;
@@ -527,12 +556,19 @@ app.put("/upload/chunk", async (request, reply) => {
     await fs.unlink(chunkPath).catch(() => {});
     throw err;
   }
-  if (!metadata.receivedChunks.includes(params.index)) {
-    metadata.receivedChunks.push(params.index);
-    metadata.receivedChunks.sort((a, b) => a - b);
-    await saveUploadMetadata(metadata);
-  }
-  reply.send({ ok: true });
+  await withUploadLock(params.uploadId, async () => {
+    const current = await loadUploadMetadata(params.uploadId);
+    if (!current) {
+      reply.code(404).send({ error: "upload_not_found" });
+      return;
+    }
+    if (!current.receivedChunks.includes(params.index)) {
+      current.receivedChunks.push(params.index);
+      current.receivedChunks.sort((a, b) => a - b);
+      await saveUploadMetadata(current);
+    }
+    reply.send({ ok: true });
+  });
 });
 
 app.post("/upload/complete", async (request, reply) => {
@@ -540,48 +576,50 @@ app.post("/upload/complete", async (request, reply) => {
     uploadId: z.string().uuid(),
   });
   const body = schema.parse(request.body);
-  const uploadsDir = getUploadsDir();
-  const chunksRootDir = getChunksRootDir();
-  const metadata = await loadUploadMetadata(body.uploadId);
-  if (!metadata) {
-    reply.code(404).send({ error: "upload_not_found" });
-    return;
-  }
-  if (metadata.receivedChunks.length !== metadata.totalChunks) {
-    reply.code(400).send({ error: "chunks_incomplete" });
-    return;
-  }
-  await fs.mkdir(uploadsDir, { recursive: true });
-  const finalPath = join(uploadsDir, `${Date.now()}-${metadata.fileName}`);
-  const hash = createHash("sha256");
-  for (let index = 0; index < metadata.totalChunks; index++) {
-    const chunkPath = join(metadata.tempDir, `${index}.part`);
-    const data = await fs.readFile(chunkPath);
-    hash.update(data);
-    await fs.appendFile(finalPath, data);
-  }
-  const digest = hash.digest("hex");
-  if (digest !== metadata.hash) {
-    await fs.unlink(finalPath).catch(() => {});
-    reply.code(400).send({ error: "hash_mismatch" });
-    return;
-  }
-  const index = await loadUploadIndex();
-  index[metadata.hash] = { sourcePath: finalPath };
-  await saveUploadIndex(index);
-  const userId = (request.headers["x-user-id"] as string) || "anonymous";
-  const task = pipeline.createTask({
-    userId,
-    fileName: metadata.fileName,
-    fileType: "pdf",
-    sourcePath: finalPath,
+  await withUploadLock(body.uploadId, async () => {
+    const uploadsDir = getUploadsDir();
+    const chunksRootDir = getChunksRootDir();
+    const metadata = await loadUploadMetadata(body.uploadId);
+    if (!metadata) {
+      reply.code(404).send({ error: "upload_not_found" });
+      return;
+    }
+    if (metadata.receivedChunks.length !== metadata.totalChunks) {
+      reply.code(400).send({ error: "chunks_incomplete" });
+      return;
+    }
+    await fs.mkdir(uploadsDir, { recursive: true });
+    const finalPath = join(uploadsDir, `${Date.now()}-${metadata.fileName}`);
+    const hash = createHash("sha256");
+    for (let index = 0; index < metadata.totalChunks; index++) {
+      const chunkPath = join(metadata.tempDir, `${index}.part`);
+      const data = await fs.readFile(chunkPath);
+      hash.update(data);
+      await fs.appendFile(finalPath, data);
+    }
+    const digest = hash.digest("hex");
+    if (digest !== metadata.hash) {
+      await fs.unlink(finalPath).catch(() => {});
+      reply.code(400).send({ error: "hash_mismatch" });
+      return;
+    }
+    const index = await loadUploadIndex();
+    index[metadata.hash] = { sourcePath: finalPath };
+    await saveUploadIndex(index);
+    const userId = (request.headers["x-user-id"] as string) || "anonymous";
+    const task = pipeline.createTask({
+      userId,
+      fileName: metadata.fileName,
+      fileType: "pdf",
+      sourcePath: finalPath,
+    });
+    const metadataPath = getUploadMetadataPath(chunksRootDir, metadata.id);
+    await fs.rm(metadata.tempDir, { recursive: true, force: true }).catch(
+      () => {}
+    );
+    await fs.unlink(metadataPath).catch(() => {});
+    reply.send({ taskId: task.id });
   });
-  const metadataPath = getUploadMetadataPath(chunksRootDir, metadata.id);
-  await fs.rm(metadata.tempDir, { recursive: true, force: true }).catch(
-    () => {}
-  );
-  await fs.unlink(metadataPath).catch(() => {});
-  reply.send({ taskId: task.id });
 });
 
 app.post("/upload", async (request, reply) => {

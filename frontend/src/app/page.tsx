@@ -126,20 +126,68 @@ type UploadInitResponse = UploadInitResponseFast | UploadInitResponseNormal;
 const backendUrl =
   process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:4000";
 
-async function computeFileHash(file: File): Promise<string | null> {
-  const w = globalThis as any;
-  const subtle = w.crypto?.subtle;
-  if (!subtle) {
-    return null;
-  }
-  const buffer = await file.arrayBuffer();
-  const digest = await subtle.digest("SHA-256", buffer);
-  const bytes = new Uint8Array(digest);
-  const parts: string[] = [];
-  for (let i = 0; i < bytes.length; i++) {
-    parts.push(bytes[i].toString(16).padStart(2, "0"));
-  }
-  return parts.join("");
+type HashWorkerRequest = {
+  type: "hash";
+  requestId: string;
+  file: File;
+  chunkSize: number;
+};
+
+type HashWorkerResponse =
+  | {
+      type: "done";
+      requestId: string;
+      hash: string;
+    }
+  | {
+      type: "error";
+      requestId: string;
+      message: string;
+    };
+
+let hashWorkerInstance: Worker | null = null;
+const hashWorkerPending = new Map<
+  string,
+  { resolve: (hash: string) => void; reject: (err: Error) => void }
+>();
+
+function getHashWorker() {
+  if (hashWorkerInstance) return hashWorkerInstance;
+  const worker = new Worker(new URL("../workers/hashWorker.ts", import.meta.url));
+  worker.addEventListener("message", (event: MessageEvent<HashWorkerResponse>) => {
+    const data = event.data;
+    if (!data || !data.requestId) return;
+    const pending = hashWorkerPending.get(data.requestId);
+    if (!pending) return;
+    if (data.type === "done") {
+      hashWorkerPending.delete(data.requestId);
+      pending.resolve(data.hash);
+      return;
+    }
+    if (data.type === "error") {
+      hashWorkerPending.delete(data.requestId);
+      pending.reject(new Error(data.message || "hash_failed"));
+    }
+  });
+  worker.addEventListener("error", () => {
+    for (const [requestId, pending] of hashWorkerPending) {
+      hashWorkerPending.delete(requestId);
+      pending.reject(new Error("hash_worker_failed"));
+    }
+  });
+  hashWorkerInstance = worker;
+  return worker;
+}
+
+async function computeFileHash(file: File): Promise<string> {
+  const worker = getHashWorker();
+  const requestId = globalThis.crypto.randomUUID();
+  const chunkSize = 4 * 1024 * 1024;
+  const message: HashWorkerRequest = { type: "hash", requestId, file, chunkSize };
+  return new Promise((resolve, reject) => {
+    hashWorkerPending.set(requestId, { resolve, reject });
+    worker.postMessage(message);
+  });
 }
 
 async function uploadFileLegacy(file: File): Promise<string> {
@@ -156,11 +204,19 @@ async function uploadFileLegacy(file: File): Promise<string> {
   return data.taskId;
 }
 
+async function readResponseErrorCode(res: Response) {
+  try {
+    const json = (await res.json()) as { error?: unknown; message?: unknown };
+    if (typeof json?.error === "string") return json.error;
+    if (typeof json?.message === "string") return json.message;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 async function uploadFileWithResume(file: File): Promise<string> {
   const hash = await computeFileHash(file);
-  if (!hash) {
-    return uploadFileLegacy(file);
-  }
   const storageKey = `visualrag_upload_${hash}`;
   let existingUploadId: string | undefined;
   try {
@@ -188,13 +244,14 @@ async function uploadFileWithResume(file: File): Promise<string> {
     }),
   });
   if (!initRes.ok) {
-    return uploadFileLegacy(file);
+    const code = await readResponseErrorCode(initRes);
+    throw new Error(code ? `upload_init_failed:${code}` : "upload_init_failed");
   }
   const initData = (await initRes.json()) as UploadInitResponse;
   if (initData.fast) {
     return initData.taskId;
   }
-  const uploadId = initData.uploadId;
+  let uploadId = initData.uploadId;
   try {
     globalThis.localStorage?.setItem(
       storageKey,
@@ -203,42 +260,127 @@ async function uploadFileWithResume(file: File): Promise<string> {
   } catch {
   }
   const uploadedSet = new Set(initData.uploadedChunks);
-  const totalChunks = initData.totalChunks;
-  const chunkSize = initData.chunkSize || defaultChunkSize;
-  for (let index = 0; index < totalChunks; index++) {
-    if (uploadedSet.has(index)) {
-      continue;
-    }
-    const start = index * chunkSize;
-    const end = Math.min(file.size, start + chunkSize);
-    const chunk = file.slice(start, end);
-    const res = await fetch(
-      `${backendUrl}/upload/chunk?uploadId=${encodeURIComponent(
-        uploadId
-      )}&index=${index}`,
-      {
-        method: "PUT",
-        headers: {
-          "Content-Type": "application/octet-stream",
-        },
-        body: chunk,
+  let totalChunks = initData.totalChunks;
+  let chunkSize = initData.chunkSize || defaultChunkSize;
+  const uploadIndices = async (indices: number[]) => {
+    if (indices.length === 0) return;
+    const abort = new AbortController();
+    const maxConcurrency = 3;
+    let running = 0;
+    let cursor = 0;
+    const uploadChunk = async (index: number) => {
+      const start = index * chunkSize;
+      const end = Math.min(file.size, start + chunkSize);
+      const chunk = file.slice(start, end);
+      const res = await fetch(
+        `${backendUrl}/upload/chunk?uploadId=${encodeURIComponent(uploadId)}&index=${index}`,
+        {
+          method: "PUT",
+          headers: {
+            "Content-Type": "application/octet-stream",
+          },
+          body: chunk,
+          signal: abort.signal,
+        }
+      );
+      if (!res.ok) {
+        const code = await readResponseErrorCode(res);
+        throw new Error(code ? `upload_chunk_failed:${code}` : "upload_chunk_failed");
       }
-    );
-    if (!res.ok) {
-      throw new Error("upload_chunk_failed");
+    };
+    await new Promise<void>((resolve, reject) => {
+      const next = () => {
+        if (cursor >= indices.length && running === 0) {
+          resolve();
+          return;
+        }
+        while (running < maxConcurrency && cursor < indices.length) {
+          const index = indices[cursor++];
+          running += 1;
+          uploadChunk(index)
+            .then(() => {
+              running -= 1;
+              next();
+            })
+            .catch((err) => {
+              abort.abort();
+              reject(err);
+            });
+        }
+      };
+      next();
+    });
+  };
+
+  const initialMissing: number[] = [];
+  for (let index = 0; index < totalChunks; index++) {
+    if (!uploadedSet.has(index)) initialMissing.push(index);
+  }
+  await uploadIndices(initialMissing);
+
+  let completeData: UploadResponse | null = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const completeRes = await fetch(`${backendUrl}/upload/complete`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ uploadId }),
+    });
+    if (completeRes.ok) {
+      completeData = (await completeRes.json()) as UploadResponse;
+      break;
     }
+    const code = await readResponseErrorCode(completeRes);
+    if (code !== "chunks_incomplete") {
+      throw new Error(code ? `upload_complete_failed:${code}` : "upload_complete_failed");
+    }
+    const refreshRes = await fetch(`${backendUrl}/upload/init`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        fileName: file.name,
+        fileSize: file.size,
+        hash,
+        chunkSize: defaultChunkSize,
+        existingUploadId: uploadId,
+      }),
+    });
+    if (!refreshRes.ok) {
+      const refreshCode = await readResponseErrorCode(refreshRes);
+      throw new Error(
+        refreshCode ? `upload_init_failed:${refreshCode}` : "upload_init_failed"
+      );
+    }
+    const refreshData = (await refreshRes.json()) as UploadInitResponse;
+    if (refreshData.fast) {
+      return refreshData.taskId;
+    }
+    totalChunks = refreshData.totalChunks;
+    chunkSize = refreshData.chunkSize || chunkSize;
+    if (refreshData.uploadId !== uploadId) {
+      uploadId = refreshData.uploadId;
+      try {
+        globalThis.localStorage?.setItem(
+          storageKey,
+          JSON.stringify({ uploadId })
+        );
+      } catch {
+      }
+    }
+    const refreshedSet = new Set(refreshData.uploadedChunks);
+    const missing: number[] = [];
+    for (let index = 0; index < refreshData.totalChunks; index++) {
+      if (!refreshedSet.has(index)) missing.push(index);
+    }
+    await uploadIndices(missing);
   }
-  const completeRes = await fetch(`${backendUrl}/upload/complete`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ uploadId }),
-  });
-  if (!completeRes.ok) {
-    throw new Error("upload_complete_failed");
+
+  if (!completeData) {
+    throw new Error("upload_complete_failed:chunks_incomplete");
   }
-  const completeData = (await completeRes.json()) as UploadResponse;
   try {
     globalThis.localStorage?.removeItem(storageKey);
   } catch {
