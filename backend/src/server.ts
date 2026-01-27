@@ -12,6 +12,8 @@ import { ProgressEmitter } from "./pipeline/progressEmitter.js";
 import { prisma } from "./db/prisma.js";
 import OpenAI from "openai";
 import { ChatOpenAI } from "@langchain/openai";
+import { ChatPromptTemplate } from "@langchain/core/prompts";
+import { RunnableLambda } from "@langchain/core/runnables";
 
 function pickRegionIdsForText(
   pageNumber: number,
@@ -865,27 +867,48 @@ app.get("/chat/stream", async (request, reply) => {
   });
   reply.raw.flushHeaders?.();
   try {
-    const results = await semanticSearch(params.documentId, params.q, params.limit);
-    const contextPieces = results.map(
-      (r, index) =>
-        `Passage ${index + 1} (page ${r.pageNumber}):\n${r.snippet}`
-    );
     const systemPrompt =
       "你是一个文档问答助手，只能基于提供的文档片段回答问题。如果文档中没有相关信息，请明确说明无法从文档中回答。回答时用中文简要、清晰地总结要点。";
-    const contextText =
-      contextPieces.length > 0
-        ? contextPieces.join("\n\n")
-        : "没有检索到与问题相关的文档片段。";
-    const prompt = [
-      "系统指令：",
-      systemPrompt,
-      "",
-      `问题：${params.q}`,
-      "",
-      "文档片段：",
-      contextText,
-    ].join("\n");
-    const stream = await chatLlm.stream(prompt);
+
+    let citations: { pageNumber: number; regionIds: string[] }[] = [];
+    const retrieve = new RunnableLambda({
+      func: async (input: {
+        documentId: string;
+        question: string;
+        limit?: number;
+      }) => {
+        const results = await semanticSearch(
+          input.documentId,
+          input.question,
+          input.limit
+        );
+        citations = results.map((r) => ({
+          pageNumber: r.pageNumber,
+          regionIds: r.regionIds,
+        }));
+        const contextPieces = results.map(
+          (r, index) =>
+            `Passage ${index + 1} (page ${r.pageNumber}):\n${r.snippet}`
+        );
+        const contextText =
+          contextPieces.length > 0
+            ? contextPieces.join("\n\n")
+            : "没有检索到与问题相关的文档片段。";
+        return { question: input.question, contextText };
+      },
+    });
+
+    const prompt = ChatPromptTemplate.fromMessages([
+      ["system", systemPrompt],
+      ["human", ["问题：{question}", "", "文档片段：", "{contextText}"].join("\n")],
+    ]);
+
+    const chain = retrieve.pipe(prompt).pipe(chatLlm);
+    const stream = await chain.stream({
+      documentId: params.documentId,
+      question: params.q,
+      limit: params.limit,
+    });
     for await (const chunk of stream) {
       if (closed) {
         break;
@@ -905,10 +928,6 @@ app.get("/chat/stream", async (request, reply) => {
     if (closed) {
       return reply;
     }
-    const citations = results.map((r) => ({
-      pageNumber: r.pageNumber,
-      regionIds: r.regionIds,
-    }));
     const donePayload = JSON.stringify({ type: "done", citations });
     reply.raw.write(`data: ${donePayload}\n\n`);
     reply.raw.end();

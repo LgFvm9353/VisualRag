@@ -14,6 +14,10 @@ import { analyzePdfLayout } from "../pdf/layoutAnalyzer.js";
 
 type StageHandler = (task: IngestionTask) => Promise<void>;
 
+function sanitizePostgresText(text: string) {
+  return text.replace(/\u0000/g, "");
+}
+
 export class IngestionPipeline {
   private tasks = new Map<string, IngestionTask>();
   private queue: IngestionTask[] = [];
@@ -159,7 +163,9 @@ export class IngestionPipeline {
       const total = textPages.length;
       for (let index = 0; index < textPages.length; index++) {
         const page = textPages[index];
-        const input = page.text.length > 8000 ? page.text.slice(0, 8000) : page.text;
+        const cleanedText = sanitizePostgresText(page.text);
+        const input =
+          cleanedText.length > 8000 ? cleanedText.slice(0, 8000) : cleanedText;
         const response = await this.openai.embeddings.create({
           model: this.embeddingModel,
           input,
@@ -167,7 +173,7 @@ export class IngestionPipeline {
         const vector = response.data[0]?.embedding ?? [];
         embeddings.push({
           pageNumber: page.pageNumber,
-          text: page.text,
+          text: cleanedText,
           embedding: vector,
         });
         const baseProgress = this.stageBaseProgress("generating_text_embeddings");
@@ -302,6 +308,7 @@ export class IngestionPipeline {
       },
     });
     for (const page of textPages) {
+      const cleanedText = sanitizePostgresText(page.text);
       const layout = layoutPages?.find((p) => p.pageNumber === page.pageNumber);
       await prisma.page.create({
         data: {
@@ -315,7 +322,7 @@ export class IngestionPipeline {
         data: {
           documentId: task.id,
           pageNumber: page.pageNumber,
-          text: page.text,
+          text: cleanedText,
         },
       });
       const embeddingEntry = textEmbeddings?.find(
@@ -323,9 +330,10 @@ export class IngestionPipeline {
       );
       if (embeddingEntry && embeddingEntry.embedding.length > 0) {
         const embeddingLiteral = `[${embeddingEntry.embedding.join(",")}]`;
+        const embeddingText = sanitizePostgresText(embeddingEntry.text);
         await prisma.$executeRaw`
           INSERT INTO "TextEmbedding" ("id", "documentId", "textPageId", "content", "embedding")
-          VALUES (${randomUUID()}, ${task.id}, ${textPage.id}, ${embeddingEntry.text}, ${embeddingLiteral}::vector)
+          VALUES (${randomUUID()}, ${task.id}, ${textPage.id}, ${embeddingText}, ${embeddingLiteral}::vector)
         `;
       }
       if (layout) {
