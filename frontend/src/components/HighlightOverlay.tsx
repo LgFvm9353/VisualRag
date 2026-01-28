@@ -32,7 +32,7 @@ function toCanvasBBox(bbox: NormalizedBBox, canvasSize: CanvasSize) {
   const height = (y1 - y0) * canvasSize.height;
   return {
     x: x0 * canvasSize.width,
-    y: y0 * canvasSize.height,
+    y: (1 - y1) * canvasSize.height,
     width,
     height,
   };

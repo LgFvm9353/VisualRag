@@ -1056,7 +1056,6 @@ export default function HomePage() {
                   className="h-64 w-full overflow-y-auto scrollbar-thin scrollbar-thumb-slate-200 px-4 py-2"
                 >
                   {chatMessages.map((m) => {
-                    const hasCitations = m.citations && m.citations.length > 0;
                     const isUser = m.role === "user";
                     return (
                       <div key={m.id} className="mb-2">
@@ -1078,27 +1077,6 @@ export default function HomePage() {
                             <div className="whitespace-pre-wrap leading-relaxed">
                               {m.content}
                             </div>
-                            {!isUser && hasCitations && viewerDocumentId && (
-                              <div className="mt-3 flex flex-wrap gap-1.5 pt-2 border-t border-slate-100">
-                                {m.citations!.map((c, idx) => (
-                                  <button
-                                    key={`${m.id}-c-${idx}`}
-                                    type="button"
-                                    onClick={() => {
-                                      setActiveReference({
-                                        documentId: viewerDocumentId,
-                                        pageNumber: c.pageNumber,
-                                        regionIds: c.regionIds,
-                                      });
-                                    }}
-                                    className="inline-flex items-center gap-1 rounded-md bg-indigo-50 px-2 py-1 text-[10px] font-medium text-indigo-700 hover:bg-indigo-100 hover:text-indigo-800 transition-colors"
-                                  >
-                                    <span className="opacity-50">P.{c.pageNumber}</span>
-                                    <span>Area {c.regionIds.length}</span>
-                                  </button>
-                                ))}
-                              </div>
-                            )}
                           </div>
                         </div>
                       </div>

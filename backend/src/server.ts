@@ -275,7 +275,7 @@ async function semanticSearch(
         documentId,
         pageNumber: { in: pageNumbers },
       },
-      orderBy: [{ pageNumber: "asc" }, { y0: "asc" }],
+      orderBy: [{ pageNumber: "asc" }, { y0: "desc" }],
     });
     const regionsByPage = new Map<number, string[]>();
     for (const r of regions) {
@@ -390,7 +390,7 @@ async function semanticSearch(
       documentId,
       pageNumber: { in: pageNumbers },
     },
-    orderBy: [{ pageNumber: "asc" }, { y0: "asc" }],
+    orderBy: [{ pageNumber: "asc" }, { y0: "desc" }],
   });
   const regionsByPage = new Map<number, string[]>();
   for (const r of regions) {
@@ -720,7 +720,7 @@ app.get("/documents/:id/regions", async (request, reply) => {
   });
   const regions = await prisma.visualRegion.findMany({
     where: { documentId: params.id },
-    orderBy: [{ pageNumber: "asc" }, { y0: "asc" }],
+    orderBy: [{ pageNumber: "asc" }, { y0: "desc" }],
   });
   const regionsByPage = new Map<number, typeof regions>();
   for (const region of regions) {
@@ -778,7 +778,7 @@ app.get("/documents/:id/search", async (request, reply) => {
       documentId: params.id,
       pageNumber: { in: pageNumbers },
     },
-    orderBy: [{ pageNumber: "asc" }, { y0: "asc" }],
+    orderBy: [{ pageNumber: "asc" }, { y0: "desc" }],
   });
   const regionsByPage = new Map<number, string[]>();
   for (const r of regions) {
