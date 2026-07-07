@@ -70,13 +70,14 @@ export class IngestionPipeline {
   createCompletedTask(params: {
     documentId: string;
     fileName: string;
+    sourcePath: string;
   }): IngestionTask {
     const now = new Date();
     const task: IngestionTask = {
       id: params.documentId,
       fileName: params.fileName,
       fileType: "pdf",
-      sourcePath: "",
+      sourcePath: params.sourcePath,
       createdAt: now,
       updatedAt: now,
       stage: "completed",

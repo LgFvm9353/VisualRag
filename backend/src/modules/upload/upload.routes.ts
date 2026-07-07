@@ -45,13 +45,28 @@ export const uploadRoutes: FastifyPluginAsync<UploadPluginOptions> = async (
     const index = await loadUploadIndex();
     const existing = index[body.hash];
     if (existing?.sourcePath && existing?.documentId) {
-      // 文件已存在且已入库 → 直接返回既有文档，不重新处理
-      const task = opts.pipeline.createCompletedTask({
-        documentId: existing.documentId,
-        fileName: body.fileName,
-      });
-      reply.send({ fast: true, taskId: task.id, documentId: existing.documentId });
-      return;
+      // 检查文件是否确实存在于磁盘（用户可能手动删了 uploads 目录）
+      let fileExists = false;
+      try {
+        await fs.access(existing.sourcePath);
+        fileExists = true;
+      } catch {
+        // 文件不存在 → 清理过期 index 条目，回退到正常上传流程
+        await withIndexLock(async () => {
+          const idx = await loadUploadIndex();
+          delete idx[body.hash];
+          await saveUploadIndex(idx);
+        });
+      }
+      if (fileExists) {
+        const task = opts.pipeline.createCompletedTask({
+          documentId: existing.documentId,
+          fileName: body.fileName,
+          sourcePath: existing.sourcePath,
+        });
+        reply.send({ fast: true, taskId: task.id, documentId: existing.documentId });
+        return;
+      }
     }
 
     const existingId = body.existingUploadId;
@@ -151,7 +166,18 @@ export const uploadRoutes: FastifyPluginAsync<UploadPluginOptions> = async (
       // 去重：其他并发上传可能已经完成并写入了同一个 hash
       const existing = index[metadata.hash];
       if (existing?.documentId) {
-        return { taskId: null as string | null, documentId: existing.documentId, skipped: true };
+        // 确认文件仍在磁盘上（用户可能手动删除）
+        let fileExists = false;
+        try {
+          await fs.access(existing.sourcePath);
+          fileExists = true;
+        } catch {
+          delete index[metadata.hash];
+        }
+        if (fileExists) {
+          return { taskId: null as string | null, documentId: existing.documentId, sourcePath: existing.sourcePath, skipped: true };
+        }
+        // 文件不存在 → 清理过期条目，回退到正常入库流程
       }
 
       // 内容寻址：用 hash 做文件名，同一份文件只存一份
@@ -188,7 +214,7 @@ export const uploadRoutes: FastifyPluginAsync<UploadPluginOptions> = async (
       index[metadata.hash] = { sourcePath: finalPath, documentId: task.id };
       await saveUploadIndex(index);
 
-      return { taskId: task.id, documentId: null as string | null, skipped: false };
+      return { taskId: task.id, documentId: null as string | null, sourcePath: null as string | null, skipped: false };
     });
 
     // 清理上传临时文件（锁外操作）
@@ -201,6 +227,7 @@ export const uploadRoutes: FastifyPluginAsync<UploadPluginOptions> = async (
       const task = opts.pipeline.createCompletedTask({
         documentId: result.documentId!,
         fileName: metadata.fileName,
+        sourcePath: result.sourcePath!,
       });
       reply.send({ taskId: task.id, documentId: result.documentId!, dedup: true });
     } else {
@@ -236,9 +263,19 @@ export const uploadRoutes: FastifyPluginAsync<UploadPluginOptions> = async (
         const index = await loadUploadIndex();
         const existing = index[fileHash];
         if (existing?.documentId) {
-          // 已有相同文件，删除临时文件
-          await fs.unlink(tmpPath).catch(() => {});
-          return { taskId: null as string | null, documentId: existing.documentId, skipped: true };
+          // 确认文件仍在磁盘上
+          let fileExists = false;
+          try {
+            await fs.access(existing.sourcePath);
+            fileExists = true;
+          } catch {
+            delete index[fileHash];
+          }
+          if (fileExists) {
+            await fs.unlink(tmpPath).catch(() => {});
+            return { taskId: null as string | null, documentId: existing.documentId, sourcePath: existing.sourcePath, skipped: true };
+          }
+          // 文件不存在 → 清理过期条目，回退到正常入库
         }
 
         // 内容寻址：移动到 hash 文件名
@@ -254,13 +291,14 @@ export const uploadRoutes: FastifyPluginAsync<UploadPluginOptions> = async (
         index[fileHash] = { sourcePath: finalPath, documentId: task.id };
         await saveUploadIndex(index);
 
-        return { taskId: task.id, documentId: null as string | null, skipped: false };
+        return { taskId: task.id, documentId: null as string | null, sourcePath: null as string | null, skipped: false };
       });
 
       if (result.skipped) {
         const task = opts.pipeline.createCompletedTask({
           documentId: result.documentId!,
           fileName,
+          sourcePath: result.sourcePath!,
         });
         reply.send({ taskId: task.id, documentId: result.documentId!, dedup: true });
       } else {
@@ -317,6 +355,16 @@ export const uploadRoutes: FastifyPluginAsync<UploadPluginOptions> = async (
     const task = opts.pipeline.getTask(params.id);
     if (!task) {
       reply.code(404).send({ error: "not found" });
+      return;
+    }
+    if (!task.sourcePath) {
+      reply.code(404).send({ error: "task_has_no_file" });
+      return;
+    }
+    try {
+      await fs.access(task.sourcePath);
+    } catch {
+      reply.code(404).send({ error: "file_not_found_on_disk" });
       return;
     }
     const { createReadStream } = await import("fs");
