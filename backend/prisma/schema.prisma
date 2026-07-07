@@ -9,73 +9,165 @@ datasource db {
   extensions = [vector]
 }
 
+// ============================================================
+// 文档（PDF + Word 统一）
+// ============================================================
+
 model Document {
-  id        String        @id @default(uuid())
-  userId    String
+  id        String   @id @default(uuid())
   fileName  String
-  createdAt DateTime      @default(now())
+  fileType  String   @default("pdf") // "pdf" | "docx"
+  fileSize  Int?                    // 字节
+  status    String   @default("processing") // "processing" | "ready" | "failed"
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
-  pages     Page[]
-  textPages TextPage[]
-  regions   VisualRegion[]
-  embeddings TextEmbedding[]
+  sections        DocumentSection[]
+  chunks          Chunk[]
+  chunkEmbeddings ChunkEmbedding[]
+  chunkContexts   ChunkContext[]
+  chatReferences  ChatReference[]
+  chatSessions    ChatSession[]
 }
 
-model Page {
-  id         String   @id @default(uuid())
-  document   Document @relation(fields: [documentId], references: [id])
-  documentId String
-  pageNumber Int
-  width      Float
-  height     Float
-}
+// ============================================================
+// 文档段落（PDF 页面 / Word 章节，统一抽象）
+// ============================================================
 
-model TextPage {
-  id         String   @id @default(uuid())
-  document   Document @relation(fields: [documentId], references: [id])
-  documentId String
-  pageNumber Int
-  text       String
-
-  embeddings TextEmbedding[]
-}
-
-model VisualRegion {
-  id         String   @id @default(uuid())
-  document   Document @relation(fields: [documentId], references: [id])
-  documentId String
-  pageNumber Int
-  type       String
-  x0         Float
-  y0         Float
-  x1         Float
-  y1         Float
-  imageEmbeddings ImageEmbedding[]
-}
-
-model TextEmbedding {
+model DocumentSection {
   id          String   @id @default(uuid())
-  document    Document @relation(fields: [documentId], references: [id])
+  document    Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
   documentId  String
-  textPage    TextPage @relation(fields: [textPageId], references: [id])
-  textPageId  String
-  content     String
-  embedding   Unsupported("vector(256)")
-  createdAt   DateTime @default(now())
+  index       Int                   // 序号（PDF=pageNumber, Word=paragraphIndex）
+  title       String?               // 章节/段落标题
+  content     String                // 该段落原始文本
+  sourceType  String   @default("pdf") // "pdf" | "docx"
+  // PDF 专用（Word 文档这些字段为 null）
+  pageNumber  Int?
+  pageWidth   Float?
+  pageHeight  Float?
+  // Word 专用（PDF 文档这些字段为 null）
+  headingLevel Int?                 // Word 标题级别 (1-6)，正文为 null
+  parentId    String?               // 父级章节 ID（层级结构）
+
+  chunks       Chunk[]
+  chunkContexts ChunkContext[]
 
   @@index([documentId])
-  @@index([textPageId])
+  @@index([documentId, index])
 }
 
-model ImageEmbedding {
-  id          String       @id @default(uuid())
-  document    Document     @relation(fields: [documentId], references: [id])
-  documentId  String
-  region      VisualRegion @relation(fields: [regionId], references: [id])
-  regionId    String
-  embedding   Unsupported("vector(256)")
-  createdAt   DateTime     @default(now())
+// ============================================================
+// Chunking（统一 PDF+Word）
+// ============================================================
+
+model Chunk {
+  id            String          @id @default(uuid())
+  document      Document        @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  documentId    String
+  section       DocumentSection @relation(fields: [sectionId], references: [id])
+  sectionId     String
+  chunkIndex    Int             // 段落内序号
+  content       String          // 分块文本
+  tokenCount    Int?
+  startOffset   Int
+  endOffset     Int
+  contextPrefix String?         // Contextual Retrieval 上下文前缀
+
+  embedding     ChunkEmbedding?
 
   @@index([documentId])
-  @@index([regionId])
+  @@index([sectionId])
+}
+
+model ChunkEmbedding {
+  id         String   @id @default(uuid())
+  chunk      Chunk    @relation(fields: [chunkId], references: [id], onDelete: Cascade)
+  chunkId    String   @unique
+  documentId String
+  document   Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  embedding  Unsupported("vector(256)")
+
+  @@index([documentId])
+}
+
+model ChunkContext {
+  id            String          @id @default(uuid())
+  document      Document        @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  documentId    String
+  section       DocumentSection @relation(fields: [sectionId], references: [id])
+  sectionId     String
+  content       String          // 大窗口上下文
+  childChunkIds String[]        // 包含的 Child Chunk ID
+  startOffset   Int
+  endOffset     Int
+
+  @@index([documentId])
+  @@index([sectionId])
+}
+
+// ============================================================
+// 对话
+// ============================================================
+
+model ChatSession {
+  id         String        @id @default(uuid())
+  documentId String?
+  document   Document?     @relation(fields: [documentId], references: [id])
+  title      String?
+  createdAt  DateTime      @default(now())
+  updatedAt  DateTime      @updatedAt
+  messages   ChatMessage[]
+}
+
+model ChatMessage {
+  id         String      @id @default(uuid())
+  session    ChatSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  sessionId  String
+  role       String      // "user" | "assistant" | "system"
+  content    String
+  audioUrl      String?          // 语音输入音频文件 URL（如用 S3/本地存储）
+  citations     Json?
+  createdAt     DateTime         @default(now())
+  chatReferences ChatReference[]
+
+  @@index([sessionId])
+}
+
+// ============================================================
+// 对话引用（回答引用了哪些 Chunk）
+// ============================================================
+
+model ChatReference {
+  id         String      @id @default(uuid())
+  message    ChatMessage @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  messageId  String
+  document   Document    @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  documentId String
+  chunkId    String
+  score      Float?      // 该 chunk 的相关性分数
+  createdAt  DateTime    @default(now())
+
+  @@index([messageId])
+  @@index([documentId])
+}
+
+// ============================================================
+// 评估
+// ============================================================
+
+model EvalRecord {
+  id                  String   @id @default(uuid())
+  query               String
+  documentId          String
+  retrievedChunkIds   String[]
+  contextualPrecision Float?
+  contextualRecall    Float?
+  faithfulness        Float?
+  nDCG5               Float?
+  mrr                 Float?
+  createdAt           DateTime @default(now())
+
+  @@index([documentId])
+  @@index([createdAt])
 }

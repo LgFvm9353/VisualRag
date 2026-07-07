@@ -37,7 +37,6 @@ export class IngestionPipeline {
   }
 
   createTask(params: {
-    userId: string;
     fileName: string;
     fileType: "pdf" | "image" | "zip";
     sourcePath: string;
@@ -45,7 +44,6 @@ export class IngestionPipeline {
     const now = new Date();
     const task: IngestionTask = {
       id: randomUUID(),
-      userId: params.userId,
       fileName: params.fileName,
       fileType: params.fileType,
       sourcePath: params.sourcePath,
@@ -291,78 +289,73 @@ export class IngestionPipeline {
           embedding: number[];
         }[]
       | undefined;
-    const imageEmbeddings = (task.meta as any)?.imageEmbeddings as
-      | {
-          regionId: string;
-          embedding: number[];
-        }[]
-      | undefined;
+
     if (!textPages || textPages.length === 0) {
       return;
     }
+
+    // 1. 创建 Document 记录
     await prisma.document.create({
       data: {
         id: task.id,
-        userId: task.userId,
         fileName: task.fileName,
+        fileType: "pdf",
+        status: "processing",
       },
     });
-    for (const page of textPages) {
+
+    // 2. 为每页创建 DocumentSection + Chunk + ChunkEmbedding
+    for (let i = 0; i < textPages.length; i++) {
+      const page = textPages[i];
       const cleanedText = sanitizePostgresText(page.text);
       const layout = layoutPages?.find((p) => p.pageNumber === page.pageNumber);
-      await prisma.page.create({
+
+      // 创建 DocumentSection
+      const section = await prisma.documentSection.create({
         data: {
           documentId: task.id,
+          index: page.pageNumber,
           pageNumber: page.pageNumber,
-          width: layout?.width ?? page.width,
-          height: layout?.height ?? page.height,
+          pageWidth: layout?.width ?? page.width,
+          pageHeight: layout?.height ?? page.height,
+          content: cleanedText,
+          sourceType: "pdf",
         },
       });
-      const textPage = await prisma.textPage.create({
+
+      // 为整页创建一个 Chunk（后续可由 ChunkingService 细粒度分块）
+      const chunk = await prisma.chunk.create({
         data: {
           documentId: task.id,
-          pageNumber: page.pageNumber,
-          text: cleanedText,
+          sectionId: section.id,
+          chunkIndex: 0,
+          content: cleanedText,
+          startOffset: 0,
+          endOffset: cleanedText.length,
         },
       });
+
+      // 创建 ChunkEmbedding
       const embeddingEntry = textEmbeddings?.find(
-        (e) => e.pageNumber === page.pageNumber
+        (e) => e.pageNumber === page.pageNumber,
       );
       if (embeddingEntry && embeddingEntry.embedding.length > 0) {
         const embeddingLiteral = `[${embeddingEntry.embedding.join(",")}]`;
-        const embeddingText = sanitizePostgresText(embeddingEntry.text);
         await prisma.$executeRaw`
-          INSERT INTO "TextEmbedding" ("id", "documentId", "textPageId", "content", "embedding")
-          VALUES (${randomUUID()}, ${task.id}, ${textPage.id}, ${embeddingText}, ${embeddingLiteral}::vector)
+          INSERT INTO "ChunkEmbedding" ("id", "chunkId", "documentId", "embedding")
+          VALUES (${randomUUID()}, ${chunk.id}, ${task.id}, ${embeddingLiteral}::vector)
         `;
       }
-      if (layout) {
-        for (const region of layout.regions) {
-          await prisma.visualRegion.create({
-            data: {
-              id: region.id,
-              documentId: task.id,
-              pageNumber: region.pageNumber,
-              type: region.type,
-              x0: region.bbox.x0,
-              y0: region.bbox.y0,
-              x1: region.bbox.x1,
-              y1: region.bbox.y1,
-            },
-          });
-          const imageEmbeddingEntry = imageEmbeddings?.find(
-            (e) => e.regionId === region.id
-          );
-          if (imageEmbeddingEntry && imageEmbeddingEntry.embedding.length > 0) {
-            const embeddingLiteral = `[${imageEmbeddingEntry.embedding.join(",")}]`;
-            await prisma.$executeRaw`
-              INSERT INTO "ImageEmbedding" ("id", "documentId", "regionId", "embedding")
-              VALUES (${randomUUID()}, ${task.id}, ${region.id}, ${embeddingLiteral}::vector)
-            `;
-          }
-        }
-      }
+
+      // 3. 布局区域不再存入 DB（前端通过 /tasks/:id/layout 获取）
+      // VisualRegion 表已移除，布局数据保留在 task.meta.layoutPages 中
     }
+
+    // 标记处理完成
+    await prisma.document.update({
+      where: { id: task.id },
+      data: { status: "ready" },
+    });
   }
 
   private async simulateWork(task: IngestionTask, stage: IngestionStage) {
