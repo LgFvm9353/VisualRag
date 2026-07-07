@@ -190,7 +190,12 @@ async function computeFileHash(file: File): Promise<string> {
   });
 }
 
-async function uploadFileLegacy(file: File): Promise<string> {
+interface UploadResult {
+  taskId: string;
+  fast: boolean;
+}
+
+async function uploadFileLegacy(file: File): Promise<UploadResult> {
   const formData = new FormData();
   formData.append("file", file);
   const res = await fetch(`${backendUrl}/upload`, {
@@ -200,8 +205,8 @@ async function uploadFileLegacy(file: File): Promise<string> {
   if (!res.ok) {
     throw new Error("upload_failed");
   }
-  const data = (await res.json()) as UploadResponse;
-  return data.taskId;
+  const data = (await res.json()) as UploadResponse & { dedup?: boolean };
+  return { taskId: data.taskId, fast: data.dedup === true };
 }
 
 async function readResponseErrorCode(res: Response) {
@@ -215,7 +220,7 @@ async function readResponseErrorCode(res: Response) {
   }
 }
 
-async function uploadFileWithResume(file: File): Promise<string> {
+async function uploadFileWithResume(file: File): Promise<UploadResult> {
   const hash = await computeFileHash(file);
   const storageKey = `visualrag_upload_${hash}`;
   let existingUploadId: string | undefined;
@@ -249,7 +254,7 @@ async function uploadFileWithResume(file: File): Promise<string> {
   }
   const initData = (await initRes.json()) as UploadInitResponse;
   if (initData.fast) {
-    return initData.taskId;
+    return { taskId: initData.taskId, fast: true };
   }
   let uploadId = initData.uploadId;
   try {
@@ -356,7 +361,7 @@ async function uploadFileWithResume(file: File): Promise<string> {
     }
     const refreshData = (await refreshRes.json()) as UploadInitResponse;
     if (refreshData.fast) {
-      return refreshData.taskId;
+      return { taskId: refreshData.taskId, fast: true };
     }
     totalChunks = refreshData.totalChunks;
     chunkSize = refreshData.chunkSize || chunkSize;
@@ -385,7 +390,8 @@ async function uploadFileWithResume(file: File): Promise<string> {
     globalThis.localStorage?.removeItem(storageKey);
   } catch {
   }
-  return completeData.taskId;
+  const resp = completeData as UploadResponse & { dedup?: boolean };
+  return { taskId: resp.taskId, fast: resp.dedup === true };
 }
 
 export default function HomePage() {
@@ -568,13 +574,22 @@ export default function HomePage() {
     setProgress(null);
     setUploadError(null);
     try {
-      const taskId = await uploadFileWithResume(file);
-      setCurrentTaskId(taskId);
-      setViewerDocumentId(taskId);
-      setPdfUrl(`${backendUrl}/files/${taskId}`);
+      const result = await uploadFileWithResume(file);
+      setCurrentTaskId(result.taskId);
+      setViewerDocumentId(result.taskId);
+      setPdfUrl(`${backendUrl}/files/${result.taskId}`);
       setSearchResults([]);
       if (socket) {
-        socket.emit("join-task", taskId);
+        socket.emit("join-task", result.taskId);
+      }
+      // 秒传：任务已瞬间完成，直接设置进度，无需等 Socket.IO 事件
+      if (result.fast) {
+        setProgress({
+          taskId: result.taskId,
+          stage: "completed",
+          progress: 100,
+          message: "completed",
+        });
       }
     } catch (error) {
       console.error("Upload error", error);

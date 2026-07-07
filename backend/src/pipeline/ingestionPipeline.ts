@@ -83,6 +83,12 @@ export class IngestionPipeline {
       progress: 100,
     };
     this.tasks.set(task.id, task);
+    // 发射完成事件，前端通过 Socket.IO 接收后停止 waiting
+    this.progressEmitter.emit(task.id, {
+      stage: "completed",
+      progress: 100,
+      message: "completed",
+    });
     return task;
   }
 
