@@ -569,10 +569,26 @@ export default function HomePage() {
     };
   }, []);
 
+  const progressPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // 组件卸载时清理轮询
+  useEffect(() => {
+    return () => {
+      if (progressPollRef.current) {
+        clearInterval(progressPollRef.current);
+      }
+    };
+  }, []);
+
   const handleUpload = async (file: File) => {
     setUploading(true);
     setProgress(null);
     setUploadError(null);
+    // 清理上一次的轮询
+    if (progressPollRef.current) {
+      clearInterval(progressPollRef.current);
+      progressPollRef.current = null;
+    }
     try {
       const result = await uploadFileWithResume(file);
       setCurrentTaskId(result.taskId);
@@ -582,14 +598,43 @@ export default function HomePage() {
       if (socket) {
         socket.emit("join-task", result.taskId);
       }
-      // 秒传：任务已瞬间完成，直接设置进度，无需等 Socket.IO 事件
       if (result.fast) {
+        // 秒传：任务已瞬间完成，直接设置进度，无需等 Socket.IO 事件
         setProgress({
           taskId: result.taskId,
           stage: "completed",
           progress: 100,
           message: "completed",
         });
+      } else {
+        // HTTP 轮询 fallback：Socket.IO 可能错过事件，用 HTTP 确保 progress 被设置
+        const poll = async () => {
+          try {
+            const res = await fetch(`${backendUrl}/tasks/${result.taskId}`);
+            if (!res.ok) return;
+            const task = (await res.json()) as {
+              id: string;
+              stage: string;
+              progress: number;
+            };
+            setProgress({
+              taskId: task.id,
+              stage: task.stage as IngestionProgressEvent["stage"],
+              progress: task.progress,
+              message: task.stage,
+            });
+            if (task.stage === "completed" || task.stage === "failed") {
+              if (progressPollRef.current) {
+                clearInterval(progressPollRef.current);
+                progressPollRef.current = null;
+              }
+            }
+          } catch {
+            // 网络错误，继续重试
+          }
+        };
+        poll(); // 立即查一次
+        progressPollRef.current = setInterval(poll, 1500);
       }
     } catch (error) {
       console.error("Upload error", error);

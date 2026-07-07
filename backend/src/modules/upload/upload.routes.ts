@@ -344,8 +344,20 @@ export const uploadRoutes: FastifyPluginAsync<UploadPluginOptions> = async (
       reply.code(404).send({ error: "not found" });
       return;
     }
-    const layoutPages = (task.meta as any)?.layoutPages ?? [];
-    reply.send({ taskId: task.id, pages: layoutPages });
+    // 1️⃣ 内存 task.meta
+    let layoutPages = (task.meta as any)?.layoutPages;
+    // 2️⃣ 磁盘回退
+    if ((!layoutPages || layoutPages.length === 0) && task.sourcePath) {
+      const { loadPersistedLayout } = await import(
+        "../../pipeline/ingestionPipeline.js"
+      );
+      const persisted = await loadPersistedLayout(task.sourcePath);
+      if (persisted) {
+        layoutPages = persisted;
+        task.meta = { ...(task.meta || {}), layoutPages: persisted };
+      }
+    }
+    reply.send({ taskId: task.id, pages: layoutPages ?? [] });
   });
 
   // ---- GET /files/:id ----

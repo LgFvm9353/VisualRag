@@ -1,4 +1,5 @@
 import { randomUUID } from "crypto";
+import { promises as fs } from "fs";
 import type { Prisma } from "@prisma/client";
 import OpenAI from "openai";
 import type {
@@ -90,6 +91,15 @@ export class IngestionPipeline {
       progress: 100,
       message: "completed",
     });
+    // 异步加载已持久化的 layout 数据，回填到 task.meta
+    loadPersistedLayout(params.sourcePath).then((layoutPages) => {
+      if (layoutPages && layoutPages.length > 0) {
+        const t = this.tasks.get(params.documentId);
+        if (t) {
+          t.meta = { ...(t.meta || {}), layoutPages };
+        }
+      }
+    });
     return task;
   }
 
@@ -127,6 +137,8 @@ export class IngestionPipeline {
         this.updateTaskStage(task, stage, (i / stages.length) * 100);
         await handler.call(this, task);
       }
+      // 持久化 layout 到磁盘（服务重启 / dedup 时需要）
+      await this.persistLayout(task);
       this.updateTaskStage(task, "completed", 100);
     } catch (err) {
       task.error = err instanceof Error ? err.message : String(err);
@@ -385,6 +397,18 @@ export class IngestionPipeline {
     });
   }
 
+  /** 持久化 layout 数据到 PDF 旁（服务重启 / dedup 上传时需要） */
+  private async persistLayout(task: IngestionTask) {
+    const layoutPages = (task.meta as any)?.layoutPages;
+    if (!layoutPages || !task.sourcePath) return;
+    try {
+      const layoutPath = task.sourcePath + ".layout.json";
+      await fs.writeFile(layoutPath, JSON.stringify(layoutPages), "utf8");
+    } catch (err) {
+      console.error("persistLayout failed", err);
+    }
+  }
+
   private async simulateWork(task: IngestionTask, stage: IngestionStage) {
     const steps = 4;
     for (let i = 1; i <= steps; i++) {
@@ -415,5 +439,16 @@ export class IngestionPipeline {
       default:
         return 0;
     }
+  }
+}
+
+/** 从磁盘加载已持久化的 layout 数据（用于服务重启后或 dedup 上传） */
+export async function loadPersistedLayout(sourcePath: string): Promise<any[] | null> {
+  try {
+    const layoutPath = sourcePath + ".layout.json";
+    const raw = await fs.readFile(layoutPath, "utf8");
+    return JSON.parse(raw);
+  } catch {
+    return null;
   }
 }
