@@ -15,9 +15,22 @@ export interface UploadMetadata {
   createdAt: string;
 }
 
-export type UploadIndex = Record<string, { sourcePath: string }>;
+export interface UploadIndexEntry {
+  sourcePath: string;
+  documentId: string;
+}
+
+export type UploadIndex = Record<string, UploadIndexEntry>;
 
 const uploadLocks = new Map<string, Promise<void>>();
+
+/** 专门用于 upload-index.json 的锁 key */
+const INDEX_LOCK_KEY = "__upload_index__";
+
+/** 对 upload-index.json 的读写操作加锁，防止并发写损坏 */
+export async function withIndexLock<T>(run: () => Promise<T>): Promise<T> {
+  return withUploadLock(INDEX_LOCK_KEY, run);
+}
 
 export function getUploadsDir() {
   return join(process.cwd(), "uploads");

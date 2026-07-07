@@ -66,6 +66,26 @@ export class IngestionPipeline {
     return this.tasks.get(taskId);
   }
 
+  /** 创建一个已完成的任务（用于去重时直接返回既有文档） */
+  createCompletedTask(params: {
+    documentId: string;
+    fileName: string;
+  }): IngestionTask {
+    const now = new Date();
+    const task: IngestionTask = {
+      id: params.documentId,
+      fileName: params.fileName,
+      fileType: "pdf",
+      sourcePath: "",
+      createdAt: now,
+      updatedAt: now,
+      stage: "completed",
+      progress: 100,
+    };
+    this.tasks.set(task.id, task);
+    return task;
+  }
+
   private enqueue(task: IngestionTask) {
     this.queue.push(task);
     this.runNext();

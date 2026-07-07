@@ -13,6 +13,7 @@ import {
   loadUploadMetadata,
   saveUploadMetadata,
   withUploadLock,
+  withIndexLock,
   getUploadsDir,
   getChunksRootDir,
   writeChunk,
@@ -43,13 +44,13 @@ export const uploadRoutes: FastifyPluginAsync<UploadPluginOptions> = async (
 
     const index = await loadUploadIndex();
     const existing = index[body.hash];
-    if (existing?.sourcePath) {
-      const task = opts.pipeline.createTask({
+    if (existing?.sourcePath && existing?.documentId) {
+      // 文件已存在且已入库 → 直接返回既有文档，不重新处理
+      const task = opts.pipeline.createCompletedTask({
+        documentId: existing.documentId,
         fileName: body.fileName,
-        fileType: "pdf",
-        sourcePath: existing.sourcePath,
       });
-      reply.send({ fast: true, taskId: task.id });
+      reply.send({ fast: true, taskId: task.id, documentId: existing.documentId });
       return;
     }
 
@@ -130,76 +131,141 @@ export const uploadRoutes: FastifyPluginAsync<UploadPluginOptions> = async (
   app.post("/upload/complete", async (request, reply) => {
     const schema = z.object({ uploadId: z.string().uuid() });
     const body = schema.parse(request.body);
-    await withUploadLock(body.uploadId, async () => {
-      const metadata = await loadUploadMetadata(body.uploadId);
-      if (!metadata) {
-        reply.code(404).send({ error: "upload_not_found" });
-        return;
+
+    const metadata = await withUploadLock(body.uploadId, () =>
+      loadUploadMetadata(body.uploadId),
+    );
+    if (!metadata) {
+      reply.code(404).send({ error: "upload_not_found" });
+      return;
+    }
+    if (metadata.receivedChunks.length !== metadata.totalChunks) {
+      reply.code(400).send({ error: "chunks_incomplete" });
+      return;
+    }
+
+    // 用 index 锁保护「读→改→写」操作，防止并发写损坏
+    const result = await withIndexLock(async () => {
+      const index = await loadUploadIndex();
+
+      // 去重：其他并发上传可能已经完成并写入了同一个 hash
+      const existing = index[metadata.hash];
+      if (existing?.documentId) {
+        return { taskId: null as string | null, documentId: existing.documentId, skipped: true };
       }
-      if (metadata.receivedChunks.length !== metadata.totalChunks) {
-        reply.code(400).send({ error: "chunks_incomplete" });
-        return;
-      }
+
+      // 内容寻址：用 hash 做文件名，同一份文件只存一份
       const uploadsDir = getUploadsDir();
       await fs.mkdir(uploadsDir, { recursive: true });
-      const finalPath = join(
-        uploadsDir,
-        `${Date.now()}-${metadata.fileName}`,
-      );
-      const digest = await assembleFile(metadata, finalPath);
-      if (digest !== metadata.hash) {
-        await fs.unlink(finalPath).catch(() => {});
-        reply.code(400).send({ error: "hash_mismatch" });
-        return;
-      }
-      const index = await loadUploadIndex();
-      index[metadata.hash] = { sourcePath: finalPath };
-      await saveUploadIndex(index);
+      const finalPath = join(uploadsDir, metadata.hash);
 
-      const userId = (request.headers["x-user-id"] as string) || "anonymous";
+      // 仅在文件不存在时才组装（双重检查）
+      let hashOnDisk: string | undefined;
+      try {
+        const { createHash } = await import("crypto");
+        const data = await fs.readFile(finalPath);
+        hashOnDisk = createHash("sha256").update(data).digest("hex");
+      } catch {
+        // 文件不存在，正常
+      }
+
+      if (hashOnDisk !== metadata.hash) {
+        const digest = await assembleFile(metadata, finalPath);
+        if (digest !== metadata.hash) {
+          await fs.unlink(finalPath).catch(() => {});
+          throw new Error("hash_mismatch");
+        }
+      }
+
+      // 创建处理任务
       const task = opts.pipeline.createTask({
-        userId,
         fileName: metadata.fileName,
         fileType: "pdf",
         sourcePath: finalPath,
       });
 
-      const chunksRootDir = getChunksRootDir();
-      const metaPath = join(chunksRootDir, `${metadata.id}.json`);
-      await fs
-        .rm(metadata.tempDir, { recursive: true, force: true })
-        .catch(() => {});
-      await fs.unlink(metaPath).catch(() => {});
+      // 写入 index（documentId = task.id，pipeline 里会用 task.id 作为 document.id）
+      index[metadata.hash] = { sourcePath: finalPath, documentId: task.id };
+      await saveUploadIndex(index);
 
-      reply.send({ taskId: task.id });
+      return { taskId: task.id, documentId: null as string | null, skipped: false };
     });
+
+    // 清理上传临时文件（锁外操作）
+    const chunksRootDir = getChunksRootDir();
+    const metaPath = join(chunksRootDir, `${metadata.id}.json`);
+    await fs.rm(metadata.tempDir, { recursive: true, force: true }).catch(() => {});
+    await fs.unlink(metaPath).catch(() => {});
+
+    if (result.skipped) {
+      const task = opts.pipeline.createCompletedTask({
+        documentId: result.documentId!,
+        fileName: metadata.fileName,
+      });
+      reply.send({ taskId: task.id, documentId: result.documentId!, dedup: true });
+    } else {
+      reply.send({ taskId: result.taskId! });
+    }
   });
 
   // ---- POST /upload (legacy multipart) ----
   app.post("/upload", async (request, reply) => {
-    await uploadRateLimiter(
-      (request.headers["x-user-id"] as string) || request.ip,
-    );
+    await uploadRateLimiter(request.ip);
     try {
       const file = await (request as any).file();
       if (!file) {
         reply.code(400).send({ error: "file expected" });
         return;
       }
-      const userId = (request.headers["x-user-id"] as string) || "anonymous";
       const fileName = file.filename || "file";
       const uploadsDir = getUploadsDir();
       await fs.mkdir(uploadsDir, { recursive: true });
-      const filePath = join(uploadsDir, `${Date.now()}-${fileName}`);
-      const writeStream = createWriteStream(filePath);
+
+      // 先写临时文件，计算 hash 后做去重
+      const tmpPath = join(uploadsDir, `tmp-${randomUUID()}`);
+      const writeStream = createWriteStream(tmpPath);
       await streamPipeline(file.file, writeStream);
-      const task = opts.pipeline.createTask({
-        userId,
-        fileName,
-        fileType: "pdf",
-        sourcePath: filePath,
+
+      // 计算文件 hash
+      const { createHash } = await import("crypto");
+      const fileData = await fs.readFile(tmpPath);
+      const fileHash = createHash("sha256").update(fileData).digest("hex");
+
+      // index 锁内做去重
+      const result = await withIndexLock(async () => {
+        const index = await loadUploadIndex();
+        const existing = index[fileHash];
+        if (existing?.documentId) {
+          // 已有相同文件，删除临时文件
+          await fs.unlink(tmpPath).catch(() => {});
+          return { taskId: null as string | null, documentId: existing.documentId, skipped: true };
+        }
+
+        // 内容寻址：移动到 hash 文件名
+        const finalPath = join(uploadsDir, fileHash);
+        await fs.rename(tmpPath, finalPath);
+
+        const task = opts.pipeline.createTask({
+          fileName,
+          fileType: "pdf",
+          sourcePath: finalPath,
+        });
+
+        index[fileHash] = { sourcePath: finalPath, documentId: task.id };
+        await saveUploadIndex(index);
+
+        return { taskId: task.id, documentId: null as string | null, skipped: false };
       });
-      reply.send({ taskId: task.id });
+
+      if (result.skipped) {
+        const task = opts.pipeline.createCompletedTask({
+          documentId: result.documentId!,
+          fileName,
+        });
+        reply.send({ taskId: task.id, documentId: result.documentId!, dedup: true });
+      } else {
+        reply.send({ taskId: result.taskId! });
+      }
     } catch (err) {
       app.log.error({ err }, "Upload failed");
       reply.code(500).send({ error: "upload_failed" });
