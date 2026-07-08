@@ -67,6 +67,7 @@ const DOCX_CONTENT_CSS = `
     background: linear-gradient(90deg, rgba(99,102,241,0.12) 0%, rgba(99,102,241,0.06) 100%);
     border-left: 3px solid #6366f1; padding-left: 0.75rem;
     border-radius: 0 0.5rem 0.5rem 0; transition: background 0.3s ease;
+    scroll-margin-top: 3rem;
   }
 `;
 
@@ -102,7 +103,7 @@ export const DocxViewer: FC<DocxViewerProps> = ({
     };
   }, []);
 
-  // 当 activeReference 变更时，滚动到对应段落
+  // 当 activeReference 变更时，高亮并滚动到对应段落
   useEffect(() => {
     if (!activeReference) return;
     if (activeReference.documentId !== documentId) return;
@@ -114,14 +115,28 @@ export const DocxViewer: FC<DocxViewerProps> = ({
     const content = contentRef.current;
     if (!content) return;
 
-    // 查找对应段落元素（data-para-index 属性由注入脚本设置）
+    // 移除之前所有高亮（先清除样式，后添加新样式，避免重复重排）
+    const prevHighlighted = content.querySelectorAll(
+      "[data-para-index].highlighted",
+    );
+    prevHighlighted.forEach((el) => {
+      el.classList.remove("highlighted");
+    });
+
+    // 查找对应段落元素（data-para-index 属性由注入脚本设置，1-based 与后端 toTextPages 对齐）
     const target = content.querySelector(
       `[data-para-index="${sectionIndex}"]`,
     ) as HTMLElement | null;
-    if (target) {
+    if (!target) return;
+
+    // 先添加高亮类，等浏览器完成布局后再滚动，避免 layout thrash 导致定位偏移
+    target.classList.add("highlighted");
+    setCurrentPage(sectionIndex);
+
+    // 使用 requestAnimationFrame 确保 DOM 布局（重排）完成后再执行滚动
+    requestAnimationFrame(() => {
       target.scrollIntoView({ behavior: "smooth", block: "center" });
-      setCurrentPage(sectionIndex);
-    }
+    });
   }, [activeReference, documentId, setCurrentPage]);
 
   // HTML 处理：注入段落索引 + 清理
@@ -149,14 +164,15 @@ export const DocxViewer: FC<DocxViewerProps> = ({
 /**
  * 向 mammoth HTML 注入段落索引（data-para-index）和 heading 标记。
  *
- * 这样搜索结果可以通过段落索引定位到具体元素。
+ * 索引从 1 开始，与后端 toTextPages() 的 1-based pageNumber 对齐。
+ * 只匹配 <h1>-<h6> 和 <p> 标签，与 parseParagraphsFromHtml() 的标签集一致。
  */
 function injectParagraphIndices(html: string): string {
-  let paraIndex = 0;
+  let paraIndex = 1;
 
-  // 匹配块级标签：h1-h6, p, li
+  // 匹配块级标签：h1-h6, p（与 parseParagraphsFromHtml 标签集对齐）
   return html.replace(
-    /<(h[1-6]|p|li)\b([^>]*)>/gi,
+    /<(h[1-6]|p)\b([^>]*)>/gi,
     (match, tag: string, attrs: string) => {
       const isHeading = /^h[1-6]$/i.test(tag);
       const headingAttr = isHeading ? ' data-heading="true"' : "";

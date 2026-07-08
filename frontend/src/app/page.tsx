@@ -983,12 +983,15 @@ export default function HomePage() {
     if (!searchQuery.trim()) return;
 
     // 确保 regions 已加载（处理时序问题：搜索时 regions 可能尚未就绪）
-    const hasRegions = Object.values(regionsByPage).some(
-      (arr) => arr.length > 0
-    );
-    if (!hasRegions && currentTaskId) {
-      console.log("[handleSearch] regions not loaded, fetching now");
-      await loadRegions(currentTaskId);
+    // Word 文档没有 layout regions，跳过加载
+    if (documentType !== "docx") {
+      const hasRegions = Object.values(regionsByPage).some(
+        (arr) => arr.length > 0
+      );
+      if (!hasRegions && currentTaskId) {
+        console.log("[handleSearch] regions not loaded, fetching now");
+        await loadRegions(currentTaskId);
+      }
     }
 
     setSearching(true);
@@ -1294,18 +1297,23 @@ export default function HomePage() {
                     setActiveReference({
                       documentId: r.documentId,
                       pageNumber: r.pageNumber,
-                      regionIds: getRegionIdsForPage(r.pageNumber, r.snippet),
+                      regionIds:
+                        documentType === "docx"
+                          ? []
+                          : getRegionIdsForPage(r.pageNumber, r.snippet),
                     });
                   }}
                   className="group block w-full rounded-xl border border-transparent bg-slate-50 px-3 py-2.5 text-left transition-all hover:border-indigo-100 hover:bg-indigo-50/50 hover:shadow-sm"
                 >
                   <div className="mb-1 flex items-center justify-between">
                     <span className="text-[10px] font-bold uppercase tracking-wider text-indigo-500 group-hover:text-indigo-600">
-                      Page {r.pageNumber}
+                      {documentType === "docx" ? "段落" : "Page"} {r.pageNumber}
                     </span>
-                    <span className="rounded-md bg-slate-200/50 px-1.5 py-0.5 text-[10px] text-slate-500">
-                      {r.regionIds.length} Regions
-                    </span>
+                    {documentType === "docx" ? null : (
+                      <span className="rounded-md bg-slate-200/50 px-1.5 py-0.5 text-[10px] text-slate-500">
+                        {r.regionIds.length} Regions
+                      </span>
+                    )}
                   </div>
                   <p className="line-clamp-2 text-xs text-slate-600 group-hover:text-slate-900">
                     {r.snippet}
