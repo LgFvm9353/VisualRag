@@ -76,19 +76,6 @@ interface DocumentRegionsResponse {
   pages: DocumentRegionsPage[];
 }
 
-interface SearchResultItem {
-  documentId: string;
-  pageNumber: number;
-  snippet: string;
-  regionIds: string[];
-}
-
-interface SearchResponse {
-  documentId: string;
-  query: string;
-  results: SearchResultItem[];
-}
-
 interface ChatMessage {
   id: string;
   role: "user" | "assistant";
@@ -448,15 +435,11 @@ export default function HomePage() {
   const [documentType, setDocumentType] = useState<"pdf" | "docx" | null>(null);
   const pdfDocRef = useRef<PDFDocumentProxy | null>(null);
   const [pdfVersion, setPdfVersion] = useState(0);
-  const [searchQuery, setSearchQuery] = useState("");
-  const [searchResults, setSearchResults] = useState<SearchResultItem[]>([]);
-  const [searching, setSearching] = useState(false);
   const [chatInput, setChatInput] = useState("");
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [chatStreaming, setChatStreaming] = useState(false);
   const [chatError, setChatError] = useState<string | null>(null);
   const [uploadError, setUploadError] = useState<string | null>(null);
-  const [searchError, setSearchError] = useState<string | null>(null);
   const chatListRef = useRef<HTMLDivElement | null>(null);
   const [speechSupported, setSpeechSupported] = useState(false);
   const [recognizing, setRecognizing] = useState(false);
@@ -721,7 +704,6 @@ export default function HomePage() {
       const result = await uploadFileWithResume(file);
       setCurrentTaskId(result.taskId);
       setViewerDocumentId(result.taskId);
-      setSearchResults([]);
       if (docType === "pdf") {
         setPdfUrl(`${backendUrl}/files/${result.taskId}`);
       }
@@ -860,7 +842,10 @@ export default function HomePage() {
             setActiveReference({
               documentId: viewerDocumentId,
               pageNumber: first.pageNumber,
-              regionIds: getRegionIdsForPage(first.pageNumber, first.snippet),
+              regionIds:
+                documentType === "docx"
+                  ? []
+                  : getRegionIdsForPage(first.pageNumber, first.snippet),
             });
           }
           if (data.citations && data.citations.length > 0) {
@@ -977,57 +962,6 @@ export default function HomePage() {
     if (chatMessages.length === 0) return;
     el.scrollTop = el.scrollHeight;
   }, [chatMessages.length]);
-
-  const handleSearch = async () => {
-    if (!viewerDocumentId) return;
-    if (!searchQuery.trim()) return;
-
-    // 确保 regions 已加载（处理时序问题：搜索时 regions 可能尚未就绪）
-    // Word 文档没有 layout regions，跳过加载
-    if (documentType !== "docx") {
-      const hasRegions = Object.values(regionsByPage).some(
-        (arr) => arr.length > 0
-      );
-      if (!hasRegions && currentTaskId) {
-        console.log("[handleSearch] regions not loaded, fetching now");
-        await loadRegions(currentTaskId);
-      }
-    }
-
-    setSearching(true);
-    setSearchError(null);
-    try {
-      const params = new URLSearchParams({ q: searchQuery.trim() });
-      const res = await fetch(
-        `${backendUrl}/documents/${viewerDocumentId}/search/semantic?${params.toString()}`
-      );
-      if (!res.ok) {
-        const message =
-          res.status === 404
-            ? "未找到搜索结果，请确认文档是否已完成处理。"
-            : "搜索失败，请稍后重试或检查后端服务。";
-        setSearchResults([]);
-        setSearchError(message);
-        return;
-      }
-      const data = (await res.json()) as SearchResponse;
-      setSearchResults(data.results);
-      const first = data.results[0];
-      if (first) {
-        setActiveReference({
-          documentId: first.documentId,
-          pageNumber: first.pageNumber,
-          regionIds: getRegionIdsForPage(first.pageNumber, first.snippet),
-        });
-      }
-    } catch (error) {
-      console.error("Search error", error);
-      setSearchResults([]);
-      setSearchError("搜索请求异常，请检查网络连接或后端服务。");
-    } finally {
-      setSearching(false);
-    }
-  };
 
 
   const lastRegionsRef = useRef<{ pageCount: number; totalRegions: number; hasTextSnippet: boolean }>({
@@ -1246,82 +1180,6 @@ export default function HomePage() {
               Waiting for task...
             </div>
           )}
-        </div>
-
-        <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
-          <div className="mb-3 text-sm font-semibold text-slate-900">
-            语义检索
-          </div>
-          <div className="flex gap-2 mb-3">
-            <input
-              type="text"
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              placeholder="搜索关键词..."
-              className="flex-1 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-900 placeholder:text-slate-400 focus:border-indigo-500 focus:bg-white focus:outline-none focus:ring-2 focus:ring-indigo-500/10 transition-all"
-            />
-            <button
-              type="button"
-              onClick={() => {
-                void handleSearch();
-              }}
-              disabled={!viewerDocumentId || searching || !searchQuery.trim()}
-              className="inline-flex items-center justify-center rounded-xl bg-indigo-600 px-4 py-2 text-sm font-medium text-white shadow-sm shadow-indigo-200 transition-all hover:bg-indigo-700 hover:shadow-indigo-300 disabled:bg-slate-100 disabled:text-slate-400 disabled:shadow-none"
-            >
-              {searching ? (
-                 <svg className="animate-spin h-4 w-4" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
-                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-                </svg>
-              ) : (
-                "Search"
-              )}
-            </button>
-          </div>
-          {searchError && (
-            <div className="mb-2 rounded-xl border border-red-100 bg-red-50 px-3 py-2 text-xs text-red-600">
-              {searchError}
-            </div>
-          )}
-          <div className="max-h-48 space-y-2 overflow-y-auto pr-1 scrollbar-thin scrollbar-thumb-slate-200">
-            {searchResults.length === 0 ? (
-              <p className="py-2 text-center text-xs text-slate-400">
-                暂无搜索结果
-              </p>
-            ) : (
-              searchResults.map((r, idx) => (
-                <button
-                  key={`${r.pageNumber}-${idx}`}
-                  type="button"
-                  onClick={() => {
-                    setActiveReference({
-                      documentId: r.documentId,
-                      pageNumber: r.pageNumber,
-                      regionIds:
-                        documentType === "docx"
-                          ? []
-                          : getRegionIdsForPage(r.pageNumber, r.snippet),
-                    });
-                  }}
-                  className="group block w-full rounded-xl border border-transparent bg-slate-50 px-3 py-2.5 text-left transition-all hover:border-indigo-100 hover:bg-indigo-50/50 hover:shadow-sm"
-                >
-                  <div className="mb-1 flex items-center justify-between">
-                    <span className="text-[10px] font-bold uppercase tracking-wider text-indigo-500 group-hover:text-indigo-600">
-                      {documentType === "docx" ? "段落" : "Page"} {r.pageNumber}
-                    </span>
-                    {documentType === "docx" ? null : (
-                      <span className="rounded-md bg-slate-200/50 px-1.5 py-0.5 text-[10px] text-slate-500">
-                        {r.regionIds.length} Regions
-                      </span>
-                    )}
-                  </div>
-                  <p className="line-clamp-2 text-xs text-slate-600 group-hover:text-slate-900">
-                    {r.snippet}
-                  </p>
-                </button>
-              ))
-            )}
-          </div>
         </div>
 
         <div className="flex flex-col rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">

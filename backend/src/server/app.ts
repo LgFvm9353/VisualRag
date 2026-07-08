@@ -6,7 +6,6 @@ import { loadEnv, config } from "../config/env.js";
 import { registerAuth } from "./plugins/auth.js";
 import { uploadRoutes } from "../modules/upload/upload.routes.js";
 import { documentRoutes } from "../modules/document/document.routes.js";
-import { searchRoutes } from "../modules/search/search.routes.js";
 import { chatRoutes } from "../modules/chat/chat.routes.js";
 import { ProgressEmitter } from "../pipeline/progressEmitter.js";
 import { IngestionPipeline } from "../pipeline/ingestionPipeline.js";
@@ -81,7 +80,6 @@ export async function buildApp() {
   // ---- Routes ----
   app.register(uploadRoutes, { pipeline, prisma });
   app.register(documentRoutes, { pipeline, prisma });
-  app.register(searchRoutes, { prisma });
   app.register(chatRoutes, { prisma, pipeline });
 
   // ---- Health ----
