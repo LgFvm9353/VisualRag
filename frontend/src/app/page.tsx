@@ -649,11 +649,12 @@ export default function HomePage() {
   };
 
   const handleChatSubmit = () => {
-    if (!viewerDocumentId) return;
     setChatError(null);
     const q = chatInput.trim();
     if (!q) return;
     if (chatStreaming) return;
+    // 无文档时使用零 UUID 作为占位，允许纯闲聊对话
+    const documentId = viewerDocumentId || "00000000-0000-0000-0000-000000000000";
     const userMessage: ChatMessage = {
       id: `${Date.now()}-user`,
       role: "user",
@@ -668,11 +669,39 @@ export default function HomePage() {
     setChatMessages((prev) => [...prev, userMessage, assistantMessage]);
     setChatInput("");
     setChatStreaming(true);
+
+    // SSE 超时保护：30 秒无响应则自动关闭，防止 chatStreaming 卡死
+    let timeoutId: ReturnType<typeof setTimeout> | null = setTimeout(() => {
+      if (timeoutId === null) return; // 已清理
+      timeoutId = null;
+      es.close();
+      setChatStreaming(false);
+      setChatError("对话超时，请重试");
+      setChatMessages((prev) => {
+        const next = [...prev];
+        const index = next.findIndex((m) => m.id === assistantId);
+        if (index === -1) return prev;
+        if (next[index].content.trim().length === 0) {
+          next[index] = { ...next[index], content: "对话超时，请重试" };
+        }
+        return next;
+      });
+    }, 30_000);
+
     const url = new URL(`${backendUrl}/chat/stream`);
-    url.searchParams.set("documentId", viewerDocumentId);
+    url.searchParams.set("documentId", documentId);
     url.searchParams.set("q", q);
     const es = new EventSource(url.toString());
+
+    const clearTimeout_ = () => {
+      if (timeoutId !== null) {
+        clearTimeout(timeoutId);
+        timeoutId = null;
+      }
+    };
+
     es.onmessage = (event) => {
+      clearTimeout_(); // 每次收到消息重置超时
       try {
         const data = JSON.parse(event.data) as ChatEventPayload;
         if (data.type === "token" && data.token) {
@@ -690,6 +719,7 @@ export default function HomePage() {
           });
         }
         if (data.type === "done") {
+          clearTimeout_();
           if (data.citations && data.citations.length > 0 && viewerDocumentId) {
             const first = data.citations[0];
             setActiveReference({
@@ -717,6 +747,7 @@ export default function HomePage() {
           return;
         }
         if (data.type === "error") {
+          clearTimeout_();
           setChatMessages((prev) => {
             const next = [...prev];
             const index = next.findIndex((m) => m.id === assistantId);
@@ -760,6 +791,7 @@ export default function HomePage() {
       }
     };
     es.onerror = () => {
+      clearTimeout_();
       setChatMessages((prev) => {
         const next = [...prev];
         const index = next.findIndex((m) => m.id === assistantId);
@@ -1174,7 +1206,7 @@ export default function HomePage() {
             <button
               type="button"
               onClick={handleChatSubmit}
-              disabled={!viewerDocumentId || chatStreaming || !chatInput.trim()}
+              disabled={chatStreaming || !chatInput.trim()}
               className="inline-flex items-center justify-center rounded-xl bg-indigo-600 px-4 py-2 text-sm font-medium text-white shadow-sm shadow-indigo-200 transition-all hover:bg-indigo-700 hover:shadow-indigo-300 disabled:bg-slate-100 disabled:text-slate-400 disabled:shadow-none"
             >
                {chatStreaming ? (

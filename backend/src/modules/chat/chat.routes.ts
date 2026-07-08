@@ -49,7 +49,6 @@ export const chatRoutes: FastifyPluginAsync<ChatPluginOptions> = async (app, opt
     });
     reply.raw.flushHeaders?.();
 
-    let lastTokenCount = 0;
     const savedCitations: unknown[] = [];
 
     function emit(payload: Record<string, unknown>) {
@@ -65,12 +64,22 @@ export const chatRoutes: FastifyPluginAsync<ChatPluginOptions> = async (app, opt
 
       emit({ type: "status", status: "classifying_intent" });
 
-      for await (const update of await graph.stream({
-        query: params.q,
-        documentId: params.documentId,
-        conversationHistory: [],
-        iterationCount: 0,
-      } as any)) {
+      // 流式 writer：LLM 每生成一个 token 就实时推送给前端
+      const writer = (token: string) => {
+        if (!closed && !reply.raw.writableEnded) {
+          emit({ type: "token", token });
+        }
+      };
+
+      for await (const update of await graph.stream(
+        {
+          query: params.q,
+          documentId: params.documentId,
+          conversationHistory: [],
+          iterationCount: 0,
+        } as any,
+        { configurable: { writer } },
+      )) {
         if (closed) break;
 
         if (update.classifyIntent) {
@@ -87,14 +96,6 @@ export const chatRoutes: FastifyPluginAsync<ChatPluginOptions> = async (app, opt
 
         if (update.generateAnswer) {
           const answer = update.generateAnswer as any;
-          const tokens: string[] = answer.answerTokens ?? [];
-          const newTokens = tokens.slice(lastTokenCount);
-          for (const token of newTokens) {
-            if (closed) break;
-            emit({ type: "token", token });
-          }
-          lastTokenCount = tokens.length;
-
           if (answer.finished) {
             emit({ type: "done", citations: savedCitations });
             break;

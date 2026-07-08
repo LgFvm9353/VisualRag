@@ -17,6 +17,7 @@
  */
 
 import { StateGraph, Annotation, START, END } from "@langchain/langgraph";
+import type { RunnableConfig } from "@langchain/core/runnables";
 import { BaseMessage, HumanMessage, AIMessage, SystemMessage } from "@langchain/core/messages";
 import { ChatOpenAI } from "@langchain/openai";
 import { config } from "../../config/env.js";
@@ -131,7 +132,15 @@ export function buildChatGraph(
     };
   }
 
-  async function* generateAnswer(state: typeof ChatState.State) {
+  async function generateAnswer(
+    state: typeof ChatState.State,
+    cfg?: RunnableConfig,
+  ) {
+    // 从 config 中获取流式 writer 回调
+    const writer = (cfg?.configurable as any)?.writer as
+      | ((token: string) => void)
+      | undefined;
+
     const systemPrompt =
       state.intent === "chat"
         ? "你是一个友好的文档问答助手。用中文简洁回答用户的问题。"
@@ -166,7 +175,8 @@ export function buildChatGraph(
           : "";
       if (content) {
         tokens.push(content);
-        yield { answerTokens: [...tokens] };
+        // 通过 writer 回调实时推送 token
+        writer?.(content);
       }
     }
 
