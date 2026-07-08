@@ -111,7 +111,7 @@ export class HybridSearchService {
           c.id as "chunkId",
           c.content as "content",
           c."documentId" as "documentId",
-          ds."pageNumber" as "pageNumber",
+          COALESCE(ds."pageNumber", ds.index)::int as "pageNumber",
           1 - (ce.embedding <=> ${embeddingLiteral}::vector) as "similarity"
         FROM "ChunkEmbedding" ce
         JOIN "Chunk" c ON c.id = ce."chunkId"
@@ -169,7 +169,7 @@ export class HybridSearchService {
             c.id as "chunkId",
             c.content as "content",
             c."documentId" as "documentId",
-            ds."pageNumber" as "pageNumber",
+            COALESCE(ds."pageNumber", ds.index)::int as "pageNumber",
             ts_rank(
               to_tsvector('simple', c.content),
               to_tsquery('simple', ${tsquery})
@@ -204,7 +204,7 @@ export class HybridSearchService {
         });
         return rows.map((r) => ({
           documentId: r.documentId,
-          pageNumber: r.section?.pageNumber ?? 0,
+          pageNumber: r.section?.pageNumber ?? r.section?.index ?? 0,
           snippet: r.content.slice(0, 500),
           fullContent: r.content,
           chunkId: r.id,

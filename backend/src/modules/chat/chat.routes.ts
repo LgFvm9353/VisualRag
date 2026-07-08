@@ -60,7 +60,7 @@ export const chatRoutes: FastifyPluginAsync<ChatPluginOptions> = async (app, opt
       const reranker = new LLMReranker();
       const hybridSearch = new HybridSearchService(opts.prisma, reranker);
       const cragService = new CragService();
-      const graph = buildChatGraph(hybridSearch, cragService);
+      const graph = buildChatGraph(hybridSearch, cragService, opts.prisma);
 
       emit({ type: "status", status: "classifying_intent" });
 

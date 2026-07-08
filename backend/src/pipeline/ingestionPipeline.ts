@@ -12,6 +12,11 @@ import { ProgressEmitter } from "./progressEmitter.js";
 import { extractTextFromPdf } from "../pdf/textExtractor.js";
 import { prisma } from "../db/prisma.js";
 import { analyzePdfLayout } from "../pdf/layoutAnalyzer.js";
+import {
+  extractTextFromDocx,
+  toTextPages,
+  type DocxParagraph,
+} from "../docx/textExtractor.js";
 
 type StageHandler = (task: IngestionTask) => Promise<void>;
 
@@ -32,6 +37,8 @@ export class IngestionPipeline {
     this.openai = new OpenAI({
       baseURL: process.env.OPENAI_BASE_URL,
       apiKey: process.env.OPENAI_API_KEY,
+      timeout: 4 * 60 * 1000, // 4 分钟超时，低于阶段超时的 5 分钟
+      maxRetries: 1,
     });
     this.embeddingModel =
       process.env.OPENAI_EMBEDDING_MODEL || "embedding-2";
@@ -39,7 +46,7 @@ export class IngestionPipeline {
 
   createTask(params: {
     fileName: string;
-    fileType: "pdf" | "image" | "zip";
+    fileType: "pdf" | "docx" | "image" | "zip";
     sourcePath: string;
   }): IngestionTask {
     const now = new Date();
@@ -52,6 +59,7 @@ export class IngestionPipeline {
       updatedAt: now,
       stage: "queued",
       progress: 0,
+      meta: {},
     };
     this.tasks.set(task.id, task);
     this.enqueue(task);
@@ -72,12 +80,16 @@ export class IngestionPipeline {
     documentId: string;
     fileName: string;
     sourcePath: string;
+    fileType?: string;
   }): IngestionTask {
     const now = new Date();
+    const detectedFileType =
+      params.fileType ??
+      (params.sourcePath?.toLowerCase().endsWith(".docx") ? "docx" : "pdf");
     const task: IngestionTask = {
       id: params.documentId,
       fileName: params.fileName,
-      fileType: "pdf",
+      fileType: detectedFileType as IngestionTask["fileType"],
       sourcePath: params.sourcePath,
       createdAt: now,
       updatedAt: now,
@@ -100,6 +112,17 @@ export class IngestionPipeline {
         }
       }
     });
+    // Word 文档：异步加载持久化 HTML
+    if (detectedFileType === "docx") {
+      loadPersistedDocxHtml(params.sourcePath).then((html) => {
+        if (html) {
+          const t = this.tasks.get(params.documentId);
+          if (t) {
+            t.meta = { ...(t.meta || {}), docxHtml: html };
+          }
+        }
+      });
+    }
     return task;
   }
 
@@ -123,22 +146,57 @@ export class IngestionPipeline {
     }
   }
 
+  /** 整个任务的总超时（毫秒） */
+  private static readonly TASK_TIMEOUT = 15 * 60 * 1000; // 15 分钟
+
   private async runTask(task: IngestionTask) {
+    const isDocx = task.fileType === "docx";
+
+    // PDF 流程：extract → layout → text-embeddings → write-db
+    // Word 流程：extract → text-embeddings → write-db（无 layout/image-embeddings）
     const stages: { stage: IngestionStage; handler: StageHandler }[] = [
       { stage: "extracting_text", handler: this.extractText },
-      { stage: "layout_analysis", handler: this.layoutAnalysis },
+      ...(!isDocx
+        ? [{ stage: "layout_analysis" as IngestionStage, handler: this.layoutAnalysis }]
+        : []),
       { stage: "generating_text_embeddings", handler: this.generateTextEmbeddings },
+      ...(!isDocx
+        ? [{ stage: "generating_image_embeddings" as IngestionStage, handler: this.generateImageEmbeddings }]
+        : []),
       { stage: "writing_database", handler: this.writeDatabase },
     ];
+
+    const taskStartTime = Date.now();
 
     try {
       for (let i = 0; i < stages.length; i++) {
         const { stage, handler } = stages[i];
-        this.updateTaskStage(task, stage, (i / stages.length) * 100);
+        const stageBase = (i / stages.length) * 100;
+        const stageSpan = 100 / stages.length;
+        this.updateTaskStage(task, stage, stageBase);
+        // 存储阶段进度信息供 handler 内部使用，
+        // 确保 handler 内发出的增量进度与阶段边界对齐
+        (task.meta as any)._stageBase = stageBase;
+        (task.meta as any)._stageSpan = stageSpan;
+
+        // 任务总超时检查（仅在阶段开始前，不 abort 正在运行的 handler，
+        // 避免 handler 在后台继续执行导致 DB 部分写入的竞态）
+        const elapsed = Date.now() - taskStartTime;
+        if (elapsed > IngestionPipeline.TASK_TIMEOUT) {
+          throw new Error(
+            `task_timeout: 总处理时间超过 ${IngestionPipeline.TASK_TIMEOUT / 1000}s`,
+          );
+        }
+
         await handler.call(this, task);
       }
-      // 持久化 layout 到磁盘（服务重启 / dedup 时需要）
-      await this.persistLayout(task);
+      // 持久化 layout / HTML 到磁盘（服务重启 / dedup 时需要）
+      // 注意：Word HTML 已在 extractText 中提前持久化，此处为兜底
+      if (isDocx) {
+        await this.persistDocxHtml(task);
+      } else {
+        await this.persistLayout(task);
+      }
       this.updateTaskStage(task, "completed", 100);
     } catch (err) {
       task.error = err instanceof Error ? err.message : String(err);
@@ -155,11 +213,25 @@ export class IngestionPipeline {
   }
 
   private async extractText(task: IngestionTask) {
-    const result = await extractTextFromPdf(task.sourcePath);
-    task.meta = {
-      ...(task.meta || {}),
-      textPages: result.pages,
-    };
+    if (task.fileType === "docx") {
+      const result = await extractTextFromDocx(task.sourcePath);
+      task.meta = {
+        ...(task.meta || {}),
+        textPages: toTextPages(result.paragraphs),
+        docxParagraphs: result.paragraphs,
+        docxHtml: result.html,
+      };
+      // 提前持久化 HTML，确保即使后续阶段失败也能恢复
+      this.persistDocxHtml(task).catch((err) =>
+        console.error("extractText persistDocxHtml failed:", err),
+      );
+    } else {
+      const result = await extractTextFromPdf(task.sourcePath);
+      task.meta = {
+        ...(task.meta || {}),
+        textPages: result.pages,
+      };
+    }
     this.tasks.set(task.id, task);
   }
 
@@ -213,8 +285,10 @@ export class IngestionPipeline {
           text: cleanedText,
           embedding: vector,
         });
-        const baseProgress = this.stageBaseProgress("generating_text_embeddings");
-        const progress = baseProgress + ((index + 1) / total) * 15;
+        const baseProgress = this.stageBaseProgress("generating_text_embeddings", task);
+        const stageSpan = (task.meta as any)?._stageSpan ?? 15;
+        const progress = baseProgress + ((index + 1) / total) * stageSpan;
+        task.progress = progress;
         this.progressEmitter.emit(task.id, {
           stage: "generating_text_embeddings",
           progress,
@@ -299,8 +373,10 @@ export class IngestionPipeline {
         regionId: region.regionId,
         embedding,
       });
-      const baseProgress = this.stageBaseProgress("generating_image_embeddings");
-      const progress = baseProgress + ((index + 1) / total) * 15;
+      const baseProgress = this.stageBaseProgress("generating_image_embeddings", task);
+      const stageSpan = (task.meta as any)?._stageSpan ?? 15;
+      const progress = baseProgress + ((index + 1) / total) * stageSpan;
+      task.progress = progress;
       this.progressEmitter.emit(task.id, {
         stage: "generating_image_embeddings",
         progress,
@@ -333,36 +409,55 @@ export class IngestionPipeline {
       return;
     }
 
+    const isDocx = task.fileType === "docx";
+    const docxParagraphs = (task.meta as any)?.docxParagraphs as
+      | DocxParagraph[]
+      | undefined;
+
     // 1. 创建 Document 记录
     await prisma.document.create({
       data: {
         id: task.id,
         fileName: task.fileName,
-        fileType: "pdf",
+        fileType: isDocx ? "docx" : "pdf",
         status: "processing",
       },
     });
 
-    // 2. 为每页创建 DocumentSection + Chunk + ChunkEmbedding
+    // 2. 为每页/每段落创建 DocumentSection + Chunk + ChunkEmbedding
     for (let i = 0; i < textPages.length; i++) {
       const page = textPages[i];
       const cleanedText = sanitizePostgresText(page.text);
       const layout = layoutPages?.find((p) => p.pageNumber === page.pageNumber);
+      const docxPara = docxParagraphs?.[i];
 
-      // 创建 DocumentSection
-      const section = await prisma.documentSection.create({
-        data: {
-          documentId: task.id,
-          index: page.pageNumber,
-          pageNumber: page.pageNumber,
-          pageWidth: layout?.width ?? page.width,
-          pageHeight: layout?.height ?? page.height,
-          content: cleanedText,
-          sourceType: "pdf",
-        },
+      // 创建 DocumentSection —— PDF 与 Word 字段不同
+      const sectionData: Record<string, unknown> = {
+        documentId: task.id,
+        index: page.pageNumber,
+        content: cleanedText,
+        sourceType: isDocx ? "docx" : "pdf",
+      };
+
+      if (isDocx) {
+        // Word 文档：使用 headingLevel/parentId，PDF 字段为 null
+        sectionData.pageNumber = null;
+        sectionData.pageWidth = null;
+        sectionData.pageHeight = null;
+        sectionData.headingLevel = docxPara?.headingLevel ?? null;
+        sectionData.parentId = docxPara?.parentIndex?.toString() ?? null;
+      } else {
+        // PDF 文档：使用 pageNumber/pageWidth/pageHeight
+        sectionData.pageNumber = page.pageNumber;
+        sectionData.pageWidth = layout?.width ?? page.width;
+        sectionData.pageHeight = layout?.height ?? page.height;
+      }
+
+      const section = await (prisma.documentSection as any).create({
+        data: sectionData,
       });
 
-      // 为整页创建一个 Chunk（后续可由 ChunkingService 细粒度分块）
+      // 为整页/整段创建一个 Chunk（后续可由 ChunkingService 细粒度分块）
       const chunk = await prisma.chunk.create({
         data: {
           documentId: task.id,
@@ -385,9 +480,6 @@ export class IngestionPipeline {
           VALUES (${randomUUID()}, ${chunk.id}, ${task.id}, ${embeddingLiteral}::vector)
         `;
       }
-
-      // 3. 布局区域不再存入 DB（前端通过 /tasks/:id/layout 获取）
-      // VisualRegion 表已移除，布局数据保留在 task.meta.layoutPages 中
     }
 
     // 标记处理完成
@@ -409,11 +501,25 @@ export class IngestionPipeline {
     }
   }
 
+  /** 持久化 Word HTML 到 .docx 文件旁（服务重启 / dedup 上传时需要） */
+  private async persistDocxHtml(task: IngestionTask) {
+    const html = (task.meta as any)?.docxHtml as string | undefined;
+    if (!html || !task.sourcePath) return;
+    try {
+      const htmlPath = task.sourcePath + ".docx.html";
+      await fs.writeFile(htmlPath, html, "utf8");
+    } catch (err) {
+      console.error("persistDocxHtml failed", err);
+    }
+  }
+
   private async simulateWork(task: IngestionTask, stage: IngestionStage) {
     const steps = 4;
     for (let i = 1; i <= steps; i++) {
-      const baseProgress = this.stageBaseProgress(stage);
-      const progress = baseProgress + (i / steps) * 15;
+      const baseProgress = this.stageBaseProgress(stage, task);
+      const stageSpan = (task.meta as any)?._stageSpan ?? 15;
+      const progress = baseProgress + (i / steps) * stageSpan;
+      task.progress = progress;
       this.progressEmitter.emit(task.id, {
         stage,
         progress,
@@ -422,23 +528,13 @@ export class IngestionPipeline {
     }
   }
 
-  private stageBaseProgress(stage: IngestionStage) {
-    switch (stage) {
-      case "extracting_text":
-        return 5;
-      case "layout_analysis":
-        return 25;
-      case "generating_text_embeddings":
-        return 45;
-      case "generating_image_embeddings":
-        return 65;
-      case "writing_database":
-        return 85;
-      case "completed":
-        return 100;
-      default:
-        return 0;
-    }
+  /**
+   * 动态计算阶段基准进度。
+   * 基准值来自 runTask() 中根据实际阶段数计算的 _stageBase，
+   * 而非硬编码值，确保 docx (3 阶段) 和 PDF (5 阶段) 都正确对齐。
+   */
+  private stageBaseProgress(_stage: IngestionStage, task: IngestionTask): number {
+    return (task.meta as any)?._stageBase ?? 0;
   }
 }
 
@@ -448,6 +544,18 @@ export async function loadPersistedLayout(sourcePath: string): Promise<any[] | n
     const layoutPath = sourcePath + ".layout.json";
     const raw = await fs.readFile(layoutPath, "utf8");
     return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+/** 从磁盘加载已持久化的 Word HTML（用于服务重启后或 dedup 上传） */
+export async function loadPersistedDocxHtml(
+  sourcePath: string,
+): Promise<string | null> {
+  try {
+    const htmlPath = sourcePath + ".docx.html";
+    return await fs.readFile(htmlPath, "utf8");
   } catch {
     return null;
   }

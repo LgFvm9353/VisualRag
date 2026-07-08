@@ -11,7 +11,7 @@ export type IngestionStage =
 export interface IngestionTask {
   id: string;
   fileName: string;
-  fileType: "pdf" | "image" | "zip";
+  fileType: "pdf" | "docx" | "image" | "zip";
   sourcePath: string;
   createdAt: Date;
   updatedAt: Date;

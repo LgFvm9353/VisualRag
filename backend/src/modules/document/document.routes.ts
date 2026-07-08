@@ -1,7 +1,10 @@
 import type { FastifyInstance, FastifyPluginAsync } from "fastify";
 import { z } from "zod";
 import type { PrismaClient } from "@prisma/client";
-import { loadPersistedLayout } from "../../pipeline/ingestionPipeline.js";
+import {
+  loadPersistedLayout,
+  loadPersistedDocxHtml,
+} from "../../pipeline/ingestionPipeline.js";
 import { loadUploadIndex } from "../upload/upload.service.js";
 import { analyzePdfLayout } from "../../pdf/layoutAnalyzer.js";
 import { writeFile } from "fs/promises";
@@ -33,6 +36,38 @@ export const documentRoutes: FastifyPluginAsync<DocumentPluginOptions> = async (
 
     const task = opts.pipeline?.getTask(params.id);
     console.log("[regions] documentId:", params.id, "task in memory:", !!task);
+
+    // 判断是否为 Word 文档（Word 无 PDF layout 分析，从 DB 读取段落信息）
+    const docType =
+      task?.fileType ??
+      (await opts.prisma.document
+        .findUnique({ where: { id: params.id }, select: { fileType: true } })
+        .then((d) => d?.fileType)) ??
+      "pdf";
+    const isDocx = docType === "docx";
+
+    // Word 文档：从 DB 读取段落信息，每个段落映射为一个"page"
+    if (isDocx) {
+      const sections = await opts.prisma.documentSection.findMany({
+        where: { documentId: params.id },
+        orderBy: { index: "asc" },
+        select: {
+          index: true,
+          headingLevel: true,
+          content: true,
+        },
+      });
+      const pages = sections.map((s) => ({
+        pageNumber: s.index,
+        width: 612,
+        height: 792,
+        regions: [],
+        headingLevel: s.headingLevel,
+        textSnippet: (s.content ?? "").slice(0, 200),
+      }));
+      reply.send({ documentId: params.id, pages });
+      return;
+    }
 
     // 1️⃣ 优先从内存 task.meta 获取（pipeline 运行时最新数据，含 regions）
     let layoutPages: any[] | null = (task?.meta as any)?.layoutPages ?? null;
@@ -126,5 +161,88 @@ export const documentRoutes: FastifyPluginAsync<DocumentPluginOptions> = async (
     }));
 
     reply.send({ documentId: params.id, pages });
+  });
+
+  // ---- GET /documents/:id/html (Word 文档 HTML 内容) ----
+  app.get("/documents/:id/html", async (request, reply) => {
+    const schema = z.object({ id: z.string().uuid() });
+    const params = schema.parse(request.params);
+
+    // 1️⃣ 优先从内存 task.meta 获取（pipeline 运行期间）
+    const task = opts.pipeline?.getTask(params.id);
+    let html: string | null = (task?.meta as any)?.docxHtml ?? null;
+
+    // 2️⃣ 回退到磁盘持久化文件（服务重启后恢复）
+    if (!html) {
+      let sourcePath = task?.sourcePath ?? null;
+      if (!sourcePath) {
+        const index = await loadUploadIndex();
+        for (const entry of Object.values(index)) {
+          if (entry.documentId === params.id) {
+            sourcePath = entry.sourcePath;
+            break;
+          }
+        }
+      }
+      if (sourcePath) {
+        html = await loadPersistedDocxHtml(sourcePath);
+        // 回填到内存
+        if (html && task) {
+          task.meta = { ...(task.meta || {}), docxHtml: html };
+        }
+      }
+
+      // 3️⃣ 磁盘无缓存但源文件存在时，实时重新解析（兜底）
+      // 必须确认是 Word 文档才调用 mammoth（否则 JSZip 会在非 ZIP 文件上报错）
+      if (!html && sourcePath) {
+        // 查询 DB 确认文档类型
+        let fileType: string | null = null;
+        try {
+          const doc = await opts.prisma.document.findUnique({
+            where: { id: params.id },
+            select: { fileType: true },
+          });
+          fileType = doc?.fileType ?? null;
+        } catch {
+          // DB 查询失败，跳过
+        }
+        if (fileType === "docx") {
+          try {
+            const { extractTextFromDocx } = await import(
+              "../../docx/textExtractor.js"
+            );
+            const result = await extractTextFromDocx(sourcePath);
+            html = result.html;
+            // 异步持久化（不阻塞响应）
+            if (html) {
+              const htmlPath = sourcePath + ".docx.html";
+              const { writeFile } = await import("fs/promises");
+              writeFile(htmlPath, html, "utf8").catch((err) =>
+                console.error("[html] persist fallback failed:", err),
+              );
+              if (task) {
+                task.meta = { ...(task.meta || {}), docxHtml: html };
+              }
+            }
+          } catch (err) {
+            console.error("[html] re-extract fallback failed:", err);
+          }
+        } else {
+          console.warn(
+            "[html] document is not docx (fileType=%s), skipping re-extract for %s",
+            fileType ?? "unknown",
+            sourcePath,
+          );
+        }
+      }
+    }
+
+    if (!html) {
+      reply.code(404).send({ error: "html_not_found" });
+      return;
+    }
+
+    reply.header("Content-Type", "text/html; charset=utf-8");
+    reply.send(html);
   });
 };

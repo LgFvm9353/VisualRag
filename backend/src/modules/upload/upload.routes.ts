@@ -6,6 +6,7 @@ import { pipeline as streamPipeline } from "stream/promises";
 import { createWriteStream } from "fs";
 import { promises as fs } from "fs";
 import type { IngestionPipeline } from "../../pipeline/ingestionPipeline.js";
+import type { PrismaClient } from "@prisma/client";
 import { uploadRateLimiter } from "../../server/plugins/rateLimit.js";
 import {
   loadUploadIndex,
@@ -20,8 +21,25 @@ import {
   assembleFile,
 } from "./upload.service.js";
 
+/** 验证去重条目对应的 DB 文档是否已处理完成 */
+async function isDocumentReady(
+  prisma: PrismaClient,
+  documentId: string,
+): Promise<boolean> {
+  try {
+    const doc = await prisma.document.findUnique({
+      where: { id: documentId },
+      select: { status: true },
+    });
+    return doc?.status === "ready";
+  } catch {
+    return false;
+  }
+}
+
 interface UploadPluginOptions {
   pipeline: IngestionPipeline;
+  prisma: PrismaClient;
 }
 
 export const uploadRoutes: FastifyPluginAsync<UploadPluginOptions> = async (
@@ -45,27 +63,38 @@ export const uploadRoutes: FastifyPluginAsync<UploadPluginOptions> = async (
     const index = await loadUploadIndex();
     const existing = index[body.hash];
     if (existing?.sourcePath && existing?.documentId) {
-      // 检查文件是否确实存在于磁盘（用户可能手动删了 uploads 目录）
-      let fileExists = false;
-      try {
-        await fs.access(existing.sourcePath);
-        fileExists = true;
-      } catch {
-        // 文件不存在 → 清理过期 index 条目，回退到正常上传流程
+      // 验证 DB 中文档确实已完成处理（防止上次管道失败的残留条目）
+      const ready = await isDocumentReady(opts.prisma, existing.documentId);
+      if (!ready) {
+        // 管道未完成 → 清理过期条目，回退到正常上传
         await withIndexLock(async () => {
           const idx = await loadUploadIndex();
           delete idx[body.hash];
           await saveUploadIndex(idx);
         });
-      }
-      if (fileExists) {
-        const task = opts.pipeline.createCompletedTask({
-          documentId: existing.documentId,
-          fileName: body.fileName,
-          sourcePath: existing.sourcePath,
-        });
-        reply.send({ fast: true, taskId: task.id, documentId: existing.documentId });
-        return;
+      } else {
+        // 检查文件是否确实存在于磁盘（用户可能手动删了 uploads 目录）
+        let fileExists = false;
+        try {
+          await fs.access(existing.sourcePath);
+          fileExists = true;
+        } catch {
+          // 文件不存在 → 清理过期 index 条目，回退到正常上传流程
+          await withIndexLock(async () => {
+            const idx = await loadUploadIndex();
+            delete idx[body.hash];
+            await saveUploadIndex(idx);
+          });
+        }
+        if (fileExists) {
+          const task = opts.pipeline.createCompletedTask({
+            documentId: existing.documentId,
+            fileName: body.fileName,
+            sourcePath: existing.sourcePath,
+          });
+          reply.send({ fast: true, taskId: task.id, documentId: existing.documentId });
+          return;
+        }
       }
     }
 
@@ -166,18 +195,26 @@ export const uploadRoutes: FastifyPluginAsync<UploadPluginOptions> = async (
       // 去重：其他并发上传可能已经完成并写入了同一个 hash
       const existing = index[metadata.hash];
       if (existing?.documentId) {
-        // 确认文件仍在磁盘上（用户可能手动删除）
-        let fileExists = false;
-        try {
-          await fs.access(existing.sourcePath);
-          fileExists = true;
-        } catch {
+        // 验证 DB 中文档确实已完成处理
+        const ready = await isDocumentReady(opts.prisma, existing.documentId);
+        if (!ready) {
+          // 管道未完成（上次可能失败）→ 清理过期条目
           delete index[metadata.hash];
+        } else {
+          // 确认文件仍在磁盘上（用户可能手动删除）
+          let fileExists = false;
+          try {
+            await fs.access(existing.sourcePath);
+            fileExists = true;
+          } catch {
+            delete index[metadata.hash];
+          }
+          if (fileExists) {
+            await saveUploadIndex(index);
+            return { taskId: null as string | null, documentId: existing.documentId, sourcePath: existing.sourcePath, skipped: true };
+          }
+          // 文件不存在 → 清理过期条目，回退到正常入库流程
         }
-        if (fileExists) {
-          return { taskId: null as string | null, documentId: existing.documentId, sourcePath: existing.sourcePath, skipped: true };
-        }
-        // 文件不存在 → 清理过期条目，回退到正常入库流程
       }
 
       // 内容寻址：用 hash 做文件名，同一份文件只存一份
@@ -204,9 +241,12 @@ export const uploadRoutes: FastifyPluginAsync<UploadPluginOptions> = async (
       }
 
       // 创建处理任务
+      const fileType = metadata.fileName.toLowerCase().endsWith(".docx")
+        ? "docx"
+        : "pdf";
       const task = opts.pipeline.createTask({
         fileName: metadata.fileName,
-        fileType: "pdf",
+        fileType,
         sourcePath: finalPath,
       });
 
@@ -263,28 +303,38 @@ export const uploadRoutes: FastifyPluginAsync<UploadPluginOptions> = async (
         const index = await loadUploadIndex();
         const existing = index[fileHash];
         if (existing?.documentId) {
-          // 确认文件仍在磁盘上
-          let fileExists = false;
-          try {
-            await fs.access(existing.sourcePath);
-            fileExists = true;
-          } catch {
+          // 验证 DB 中文档确实已完成处理
+          const ready = await isDocumentReady(opts.prisma, existing.documentId);
+          if (!ready) {
             delete index[fileHash];
+          } else {
+            // 确认文件仍在磁盘上
+            let fileExists = false;
+            try {
+              await fs.access(existing.sourcePath);
+              fileExists = true;
+            } catch {
+              delete index[fileHash];
+            }
+            if (fileExists) {
+              await fs.unlink(tmpPath).catch(() => {});
+              await saveUploadIndex(index);
+              return { taskId: null as string | null, documentId: existing.documentId, sourcePath: existing.sourcePath, skipped: true };
+            }
+            // 文件不存在 → 清理过期条目，回退到正常入库
           }
-          if (fileExists) {
-            await fs.unlink(tmpPath).catch(() => {});
-            return { taskId: null as string | null, documentId: existing.documentId, sourcePath: existing.sourcePath, skipped: true };
-          }
-          // 文件不存在 → 清理过期条目，回退到正常入库
         }
 
         // 内容寻址：移动到 hash 文件名
         const finalPath = join(uploadsDir, fileHash);
         await fs.rename(tmpPath, finalPath);
 
+        const fileType = fileName.toLowerCase().endsWith(".docx")
+          ? "docx"
+          : "pdf";
         const task = opts.pipeline.createTask({
           fileName,
-          fileType: "pdf",
+          fileType,
           sourcePath: finalPath,
         });
 
@@ -381,7 +431,15 @@ export const uploadRoutes: FastifyPluginAsync<UploadPluginOptions> = async (
     }
     const { createReadStream } = await import("fs");
     const stream = createReadStream(task.sourcePath);
-    reply.header("Content-Type", "application/pdf");
+    const isDocx =
+      task.fileType === "docx" ||
+      task.sourcePath?.toLowerCase().endsWith(".docx");
+    reply.header(
+      "Content-Type",
+      isDocx
+        ? "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        : "application/pdf",
+    );
     return reply.send(stream);
   });
 };

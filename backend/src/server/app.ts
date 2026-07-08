@@ -79,7 +79,7 @@ export async function buildApp() {
   });
 
   // ---- Routes ----
-  app.register(uploadRoutes, { pipeline });
+  app.register(uploadRoutes, { pipeline, prisma });
   app.register(documentRoutes, { pipeline, prisma });
   app.register(searchRoutes, { prisma });
   app.register(chatRoutes, { prisma, pipeline });

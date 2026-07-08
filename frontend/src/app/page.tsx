@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import io, { type Socket } from "socket.io-client";
 import { PdfViewer, type PdfPageMetadata } from "@/components/PdfViewer";
+import { DocxViewer } from "@/components/DocxViewer";
 import type { VisualRegion as ViewerRegion } from "@/components/HighlightOverlay";
 import { usePdfViewerStore } from "@/store/pdfViewerStore";
 import {
@@ -396,6 +397,43 @@ async function uploadFileWithResume(file: File): Promise<UploadResult> {
   return { taskId: resp.taskId, fast: resp.dedup === true };
 }
 
+/** 检查文件是否为支持的格式（PDF 或 Word） */
+function isAcceptedFile(file: File): boolean {
+  const isPdf =
+    file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf");
+  const isDocx =
+    file.type ===
+      "application/vnd.openxmlformats-officedocument.wordprocessingml.document" ||
+    file.name.toLowerCase().endsWith(".docx");
+  return isPdf || isDocx;
+}
+
+/** 根据文件名检测文档类型 */
+function detectDocType(fileName: string): "pdf" | "docx" {
+  return fileName.toLowerCase().endsWith(".docx") ? "docx" : "pdf";
+}
+
+/** 加载 Word 文档 HTML，带重试 */
+async function loadDocxHtml(
+  documentId: string,
+  maxRetries = 3,
+): Promise<string | null> {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      const res = await fetch(`${backendUrl}/documents/${documentId}/html`);
+      if (res.ok) return await res.text();
+      // 404 不重试（HTML 根本不存在）
+      if (res.status === 404) return null;
+    } catch {
+      // 网络错误，继续重试
+    }
+    if (attempt < maxRetries) {
+      await new Promise((r) => setTimeout(r, 1000 * attempt)); // 递增等待
+    }
+  }
+  return null;
+}
+
 export default function HomePage() {
   const [socket, setSocket] = useState<Socket | null>(null);
   const [currentTaskId, setCurrentTaskId] = useState<string | null>(null);
@@ -405,6 +443,9 @@ export default function HomePage() {
   const [regionsByPage, setRegionsByPage] = useState<Record<number, ViewerRegion[]>>({});
   const [viewerDocumentId, setViewerDocumentId] = useState<string | null>(null);
   const [pdfUrl, setPdfUrl] = useState<string | null>(null);
+  const [docxHtml, setDocxHtml] = useState<string | null>(null);
+  const [docxHtmlError, setDocxHtmlError] = useState(false);
+  const [documentType, setDocumentType] = useState<"pdf" | "docx" | null>(null);
   const pdfDocRef = useRef<PDFDocumentProxy | null>(null);
   const [pdfVersion, setPdfVersion] = useState(0);
   const [searchQuery, setSearchQuery] = useState("");
@@ -547,6 +588,7 @@ export default function HomePage() {
   useEffect(() => {
     if (!socket) return;
     const handler = (event: IngestionProgressEvent) => {
+      lastSocketProgressTs.current = Date.now();
       setProgress(event);
     };
     socket.on("ingestion:progress", handler);
@@ -554,6 +596,43 @@ export default function HomePage() {
       socket.off("ingestion:progress", handler);
     };
   }, [socket]);
+
+  // Word 文档完成处理时自动加载 HTML
+  useEffect(() => {
+    if (
+      documentType !== "docx" ||
+      !viewerDocumentId ||
+      progress?.stage !== "completed"
+    ) {
+      return;
+    }
+    let cancelled = false;
+    setDocxHtmlError(false);
+    loadDocxHtml(viewerDocumentId).then((html) => {
+      if (cancelled) return;
+      if (html) {
+        setDocxHtml(html);
+        setDocxHtmlError(false);
+      } else {
+        setDocxHtmlError(true);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [documentType, viewerDocumentId, progress?.stage]);
+
+  // Word 文档处理失败时显示错误（而非永久 loading）
+  useEffect(() => {
+    if (
+      documentType !== "docx" ||
+      !viewerDocumentId ||
+      progress?.stage !== "failed"
+    ) {
+      return;
+    }
+    setDocxHtmlError(true);
+  }, [documentType, viewerDocumentId, progress?.stage]);
 
   useEffect(() => {
     const w = globalThis as any;
@@ -605,6 +684,8 @@ export default function HomePage() {
   }, []);
 
   const progressPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  /** Socket.IO 最近一次进度更新时间戳，用于防止 HTTP 轮询用过期值覆盖 */
+  const lastSocketProgressTs = useRef(0);
 
   // 组件卸载时清理轮询
   useEffect(() => {
@@ -619,17 +700,31 @@ export default function HomePage() {
     setUploading(true);
     setProgress(null);
     setUploadError(null);
+    // 清理上一次的数据
+    setPdfUrl(null);
+    setDocxHtml(null);
+    setDocxHtmlError(false);
+    setPages([]);
+    setRegionsByPage({});
+    if (pdfDocRef.current) {
+      pdfDocRef.current.destroy().catch(() => {});
+      pdfDocRef.current = null;
+    }
     // 清理上一次的轮询
     if (progressPollRef.current) {
       clearInterval(progressPollRef.current);
       progressPollRef.current = null;
     }
+    const docType = detectDocType(file.name);
+    setDocumentType(docType);
     try {
       const result = await uploadFileWithResume(file);
       setCurrentTaskId(result.taskId);
       setViewerDocumentId(result.taskId);
-      setPdfUrl(`${backendUrl}/files/${result.taskId}`);
       setSearchResults([]);
+      if (docType === "pdf") {
+        setPdfUrl(`${backendUrl}/files/${result.taskId}`);
+      }
       if (socket) {
         socket.emit("join-task", result.taskId);
       }
@@ -645,6 +740,11 @@ export default function HomePage() {
         // HTTP 轮询 fallback：Socket.IO 可能错过事件，用 HTTP 确保 progress 被设置
         const poll = async () => {
           try {
+            // 如果 Socket.IO 在 3 秒内有更新，跳过本次轮询，
+            // 避免用过期的 task.progress 覆盖 Socket.IO 推送的实时进度
+            if (Date.now() - lastSocketProgressTs.current < 3000) {
+              return;
+            }
             const res = await fetch(`${backendUrl}/tasks/${result.taskId}`);
             if (!res.ok) return;
             const task = (await res.json()) as {
@@ -970,10 +1070,11 @@ export default function HomePage() {
       const nextHasTextSnippet = Object.values(nextRegionsByPage).some((arr) =>
         arr.some((r) => !!(r as any).textSnippet)
       );
+      const improved = !lastRegionsRef.current.hasTextSnippet && nextHasTextSnippet;
       if (
         lastRegionsRef.current.pageCount === nextPages.length &&
         lastRegionsRef.current.totalRegions === totalRegions &&
-        lastRegionsRef.current.hasTextSnippet
+        !improved
       ) {
         console.log("[loadRegions] same result, skipping state update");
         return totalRegions > 0;
@@ -993,6 +1094,8 @@ export default function HomePage() {
   useEffect(() => {
     if (!currentTaskId) return;
     if (!progress) return;
+    // Word 文档不需要 PDF layout regions，跳过
+    if (documentType === "docx") return;
     const stage = progress.stage;
     const stageAfterLayout =
       stage === "layout_analysis" ||
@@ -1012,7 +1115,7 @@ export default function HomePage() {
     if (!hasAnyRegion) {
       void loadRegions(currentTaskId);
     }
-  }, [currentTaskId, progress, regionsByPage, loadRegions]);
+  }, [currentTaskId, progress, regionsByPage, loadRegions, documentType]);
 
   useEffect(() => {
     if (!pdfUrl) return;
@@ -1041,7 +1144,7 @@ export default function HomePage() {
       <input
         ref={mainUploadInputRef}
         type="file"
-        accept="application/pdf"
+        accept=".pdf,.docx,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
         className="hidden"
         onChange={(e) => {
           const f = e.target.files?.[0];
@@ -1074,7 +1177,7 @@ export default function HomePage() {
             onDrop={(e) => {
               e.preventDefault();
               const file = e.dataTransfer.files?.[0];
-              if (file && file.type === "application/pdf") {
+              if (file && isAcceptedFile(file)) {
                 void handleUpload(file);
               }
             }}
@@ -1099,7 +1202,7 @@ export default function HomePage() {
             >
               点击上传
             </button>
-            <p className="text-xs text-slate-500">或将 PDF 文件拖拽至此处</p>
+            <p className="text-xs text-slate-500">或将 PDF / Word 文件拖拽至此处</p>
           </div>
           {uploadError && (
             <div className="mt-2 rounded-xl border border-red-100 bg-red-50 px-3 py-2 text-xs text-red-600">
@@ -1330,7 +1433,7 @@ export default function HomePage() {
         <div className="absolute inset-0 z-0 opacity-[0.03]" style={{ backgroundImage: 'radial-gradient(#6366f1 1px, transparent 1px)', backgroundSize: '24px 24px' }}></div>
         <div className="relative z-10 flex h-full flex-col p-4 lg:p-8">
            <div className="h-full w-full overflow-hidden rounded-3xl border border-slate-200 bg-white shadow-[0_8px_40px_-12px_rgba(0,0,0,0.1)] ring-1 ring-slate-900/5">
-             {pages.length === 0 ? (
+             {!viewerDocumentId ? (
                <div
                  className="flex h-full w-full cursor-pointer flex-col items-center justify-center gap-3 border-2 border-dashed border-slate-200 bg-slate-50/70 px-8 text-center transition-colors hover:border-indigo-300 hover:bg-indigo-50/40"
                  onDragOver={(e) => {
@@ -1340,7 +1443,7 @@ export default function HomePage() {
                    e.preventDefault();
                    if (uploading) return;
                    const file = e.dataTransfer.files?.[0];
-                   if (file && file.type === "application/pdf") {
+                   if (file && isAcceptedFile(file)) {
                      void handleUpload(file);
                    }
                  }}
@@ -1355,11 +1458,40 @@ export default function HomePage() {
                    </svg>
                  </div>
                  <div className="text-sm font-semibold text-slate-900">
-                   点击或拖拽 PDF 到此区域上传
+                   点击或拖拽文档到此区域上传
                  </div>
                  <div className="text-xs text-slate-500">
-                   支持单个 PDF 文件上传，处理中可在左侧查看进度
+                   支持 PDF 和 Word (.docx) 文档，处理中可在左侧查看进度
                  </div>
+               </div>
+             ) : documentType === "docx" && docxHtml ? (
+               <DocxViewer
+                 documentId={viewerDocumentId}
+                 html={docxHtml}
+               />
+             ) : documentType === "docx" && docxHtmlError ? (
+               <div className="flex h-full w-full flex-col items-center justify-center gap-3 text-sm text-slate-500">
+                 <p>文档内容加载失败</p>
+                 <button
+                   type="button"
+                   className="rounded-xl bg-indigo-600 px-4 py-2 text-sm font-medium text-white shadow-sm transition hover:bg-indigo-700"
+                   onClick={() => {
+                     setDocxHtmlError(false);
+                     loadDocxHtml(viewerDocumentId!).then((html) => {
+                       if (html) {
+                         setDocxHtml(html);
+                       } else {
+                         setDocxHtmlError(true);
+                       }
+                     });
+                   }}
+                 >
+                   重新加载
+                 </button>
+               </div>
+             ) : documentType === "docx" ? (
+               <div className="flex h-full w-full items-center justify-center text-sm text-slate-400">
+                 正在加载文档内容...
                </div>
              ) : (
                <PdfViewer

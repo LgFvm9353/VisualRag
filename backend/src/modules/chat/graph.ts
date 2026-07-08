@@ -24,6 +24,7 @@ import { config } from "../../config/env.js";
 import { logger } from "../../lib/logger.js";
 import type { HybridSearchService } from "../search/retrieval/hybrid-search.service.js";
 import type { CragService } from "../search/retrieval/crag.service.js";
+import type { PrismaClient } from "@prisma/client";
 
 // ---- State ----
 const ChatState = Annotation.Root({
@@ -38,7 +39,7 @@ const ChatState = Annotation.Root({
     default: () => "",
     reducer: ((_prev: any, next: any) => next) as any,
   }),
-  citations: Annotation<{ pageNumber: number; chunkId?: string; snippet: string }[]>({
+  citations: Annotation<{ pageNumber: number; chunkId?: string; snippet: string; sourceType?: string }[]>({
     default: () => [],
     reducer: ((_prev: any, next: any) => next) as any,
   }),
@@ -90,6 +91,7 @@ const INTENT_PROMPT = `分析用户问题，判断意图类型。只输出以下
 export function buildChatGraph(
   hybridSearch: HybridSearchService,
   cragService: CragService,
+  prisma?: PrismaClient,
 ) {
   async function classifyIntent(state: typeof ChatState.State) {
     const response = await intentLlm.invoke([
@@ -110,19 +112,35 @@ export function buildChatGraph(
       return { retrievedContext: "", citations: [] };
     }
 
+    // 检测文档类型（Word vs PDF），用于引用标签
+    let sourceType = "pdf";
+    if (prisma && state.documentId) {
+      try {
+        const doc = await prisma.document.findUnique({
+          where: { id: state.documentId },
+          select: { fileType: true },
+        });
+        sourceType = doc?.fileType === "docx" ? "docx" : "pdf";
+      } catch {
+        // 查 DB 失败时默认 pdf
+      }
+    }
+
     const results = await hybridSearch.search({
       documentIds: [state.documentId],
       query: state.query,
       topK: state.intent === "complex_reasoning" ? 15 : 8,
     });
 
+    const locationLabel = sourceType === "docx" ? "段落" : "页";
     const contextPieces = results.map(
-      (r, i) => `[片段 ${i + 1}] (第 ${r.pageNumber} 页):\n${r.fullContent || r.snippet}`,
+      (r, i) => `[片段 ${i + 1}] (第 ${r.pageNumber} ${locationLabel}):\n${r.fullContent || r.snippet}`,
     );
     const citations = results.map((r) => ({
       pageNumber: r.pageNumber,
       chunkId: r.chunkId,
       snippet: r.snippet,
+      sourceType,
     }));
 
     return {
