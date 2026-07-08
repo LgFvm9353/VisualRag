@@ -116,6 +116,7 @@ export async function analyzePdfLayout(
           x1: nx1,
           y1: ny1,
         },
+        textSnippet: texts,
       });
     }
     pages.push({

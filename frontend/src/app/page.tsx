@@ -95,6 +95,7 @@ interface ChatMessage {
   citations?: {
     pageNumber: number;
     regionIds: string[];
+    snippet?: string;
   }[];
 }
 
@@ -104,6 +105,7 @@ interface ChatEventPayload {
   citations?: {
     pageNumber: number;
     regionIds: string[];
+    snippet?: string;
   }[];
   message?: string;
 }
@@ -502,15 +504,34 @@ export default function HomePage() {
 
   const setActiveReference = usePdfViewerStore((s) => s.setActiveReference);
 
-  const getRegionIdsForPage = (pageNumber: number): string[] => {
+  const getRegionIdsForPage = (pageNumber: number, snippet?: string): string[] => {
     const regions = regionsByPage[pageNumber] || [];
-    const ids = regions.map((r) => r.id);
+    if (!snippet || regions.length === 0) return regions.map((r) => r.id);
+
+    // 将 snippet 拆分为有意义的词，匹配 region 的 textSnippet
+    const keywords = snippet
+      .split(/\s+/)
+      .filter((k) => k.length > 1);
+    if (keywords.length === 0) return regions.map((r) => r.id);
+
+    const ids = regions
+      .filter((r) => {
+        const text = (r as any).textSnippet || "";
+        if (!text) return false;
+        return keywords.some((kw) => text.includes(kw));
+      })
+      .map((r) => r.id);
+
     console.log(
       "[getRegionIdsForPage] page",
       pageNumber,
-      "→",
+      "snippet keywords:",
+      keywords.length,
+      "→ matched",
       ids.length,
-      "region ids"
+      "/",
+      regions.length,
+      "regions"
     );
     return ids;
   };
@@ -739,7 +760,7 @@ export default function HomePage() {
             setActiveReference({
               documentId: viewerDocumentId,
               pageNumber: first.pageNumber,
-              regionIds: getRegionIdsForPage(first.pageNumber),
+              regionIds: getRegionIdsForPage(first.pageNumber, first.snippet),
             });
           }
           if (data.citations && data.citations.length > 0) {
@@ -893,7 +914,7 @@ export default function HomePage() {
         setActiveReference({
           documentId: first.documentId,
           pageNumber: first.pageNumber,
-          regionIds: getRegionIdsForPage(first.pageNumber),
+          regionIds: getRegionIdsForPage(first.pageNumber, first.snippet),
         });
       }
     } catch (error) {
@@ -906,9 +927,10 @@ export default function HomePage() {
   };
 
 
-  const lastRegionsRef = useRef<{ pageCount: number; totalRegions: number }>({
+  const lastRegionsRef = useRef<{ pageCount: number; totalRegions: number; hasTextSnippet: boolean }>({
     pageCount: -1,
     totalRegions: -1,
+    hasTextSnippet: false,
   });
 
   const loadRegions = useCallback(
@@ -932,6 +954,7 @@ export default function HomePage() {
           id: r.id,
           type: r.type,
           bbox: r.bbox,
+          textSnippet: (r as any).textSnippet || "",
         }));
         totalRegions += p.regions.length;
       });
@@ -943,14 +966,23 @@ export default function HomePage() {
         "regions"
       );
       // 避免死循环：如果结果与上次相同，跳过状态更新
+      // 但当旧数据无 textSnippet 而新数据有时，允许更新
+      const nextHasTextSnippet = Object.values(nextRegionsByPage).some((arr) =>
+        arr.some((r) => !!(r as any).textSnippet)
+      );
       if (
         lastRegionsRef.current.pageCount === nextPages.length &&
-        lastRegionsRef.current.totalRegions === totalRegions
+        lastRegionsRef.current.totalRegions === totalRegions &&
+        lastRegionsRef.current.hasTextSnippet
       ) {
         console.log("[loadRegions] same result, skipping state update");
         return totalRegions > 0;
       }
-      lastRegionsRef.current = { pageCount: nextPages.length, totalRegions };
+      lastRegionsRef.current = {
+        pageCount: nextPages.length,
+        totalRegions,
+        hasTextSnippet: nextHasTextSnippet,
+      };
       setPages(nextPages);
       setRegionsByPage(nextRegionsByPage);
       return totalRegions > 0;
@@ -1159,7 +1191,7 @@ export default function HomePage() {
                     setActiveReference({
                       documentId: r.documentId,
                       pageNumber: r.pageNumber,
-                      regionIds: getRegionIdsForPage(r.pageNumber),
+                      regionIds: getRegionIdsForPage(r.pageNumber, r.snippet),
                     });
                   }}
                   className="group block w-full rounded-xl border border-transparent bg-slate-50 px-3 py-2.5 text-left transition-all hover:border-indigo-100 hover:bg-indigo-50/50 hover:shadow-sm"

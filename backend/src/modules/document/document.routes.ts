@@ -121,6 +121,7 @@ export const documentRoutes: FastifyPluginAsync<DocumentPluginOptions> = async (
         pageNumber: r.pageNumber ?? p.pageNumber,
         type: r.type ?? "other",
         bbox: r.bbox,
+        textSnippet: r.textSnippet ?? "",
       })),
     }));
 

@@ -13,6 +13,7 @@ export interface VisualRegion {
   id: string;
   bbox: NormalizedBBox;
   type?: string;
+  textSnippet?: string;
 }
 
 export interface CanvasSize {
