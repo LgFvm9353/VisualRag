@@ -54,11 +54,11 @@ export const HighlightOverlay: FC<HighlightOverlayProps> = ({
         const box = toCanvasBBox(region.bbox, canvasSize);
         const baseClass =
           "absolute rounded-md border-2 transition-all duration-200 ease-out";
-        let activeClass = "border-cyan-400 bg-cyan-400/20";
+        let activeClass = "border-red-400 bg-red-400/20";
         if (region.type === "table") {
-          activeClass = "border-amber-400 bg-amber-400/20";
+          activeClass = "border-red-400 bg-red-400/20";
         } else if (region.type === "figure") {
-          activeClass = "border-cyan-400 bg-cyan-400/20";
+          activeClass = "border-red-400 bg-red-400/20";
         }
 
         return (

@@ -404,6 +404,7 @@ export default function HomePage() {
   const [viewerDocumentId, setViewerDocumentId] = useState<string | null>(null);
   const [pdfUrl, setPdfUrl] = useState<string | null>(null);
   const pdfDocRef = useRef<PDFDocumentProxy | null>(null);
+  const [pdfVersion, setPdfVersion] = useState(0);
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResults, setSearchResults] = useState<SearchResultItem[]>([]);
   const [searching, setSearching] = useState(false);
@@ -496,10 +497,23 @@ export default function HomePage() {
       pageRenderQueueRef.current[page.pageNumber] = next;
       return next;
     },
-    []
+    [pdfVersion]
   );
 
   const setActiveReference = usePdfViewerStore((s) => s.setActiveReference);
+
+  const getRegionIdsForPage = (pageNumber: number): string[] => {
+    const regions = regionsByPage[pageNumber] || [];
+    const ids = regions.map((r) => r.id);
+    console.log(
+      "[getRegionIdsForPage] page",
+      pageNumber,
+      "→",
+      ids.length,
+      "region ids"
+    );
+    return ids;
+  };
 
   useEffect(() => {
     const s = io(backendUrl);
@@ -725,7 +739,7 @@ export default function HomePage() {
             setActiveReference({
               documentId: viewerDocumentId,
               pageNumber: first.pageNumber,
-              regionIds: first.regionIds,
+              regionIds: getRegionIdsForPage(first.pageNumber),
             });
           }
           if (data.citations && data.citations.length > 0) {
@@ -846,6 +860,16 @@ export default function HomePage() {
   const handleSearch = async () => {
     if (!viewerDocumentId) return;
     if (!searchQuery.trim()) return;
+
+    // 确保 regions 已加载（处理时序问题：搜索时 regions 可能尚未就绪）
+    const hasRegions = Object.values(regionsByPage).some(
+      (arr) => arr.length > 0
+    );
+    if (!hasRegions && currentTaskId) {
+      console.log("[handleSearch] regions not loaded, fetching now");
+      await loadRegions(currentTaskId);
+    }
+
     setSearching(true);
     setSearchError(null);
     try {
@@ -869,7 +893,7 @@ export default function HomePage() {
         setActiveReference({
           documentId: first.documentId,
           pageNumber: first.pageNumber,
-          regionIds: first.regionIds,
+          regionIds: getRegionIdsForPage(first.pageNumber),
         });
       }
     } catch (error) {
@@ -882,11 +906,18 @@ export default function HomePage() {
   };
 
 
-  useEffect(() => {
-    const loadLayout = async (taskId: string) => {
+  const lastRegionsRef = useRef<{ pageCount: number; totalRegions: number }>({
+    pageCount: -1,
+    totalRegions: -1,
+  });
+
+  const loadRegions = useCallback(
+    async (taskId: string) => {
+      console.log("[loadRegions] fetching", taskId);
       const res = await fetch(`${backendUrl}/documents/${taskId}/regions`);
       if (!res.ok) {
-        return;
+        console.log("[loadRegions] failed status", res.status);
+        return false;
       }
       const data = (await res.json()) as DocumentRegionsResponse;
       const nextPages: PdfPageMetadata[] = data.pages.map((p) => ({
@@ -895,16 +926,39 @@ export default function HomePage() {
         height: p.height,
       }));
       const nextRegionsByPage: Record<number, ViewerRegion[]> = {};
+      let totalRegions = 0;
       data.pages.forEach((p) => {
         nextRegionsByPage[p.pageNumber] = p.regions.map((r) => ({
           id: r.id,
           type: r.type,
           bbox: r.bbox,
         }));
+        totalRegions += p.regions.length;
       });
+      console.log(
+        "[loadRegions] loaded",
+        nextPages.length,
+        "pages,",
+        totalRegions,
+        "regions"
+      );
+      // 避免死循环：如果结果与上次相同，跳过状态更新
+      if (
+        lastRegionsRef.current.pageCount === nextPages.length &&
+        lastRegionsRef.current.totalRegions === totalRegions
+      ) {
+        console.log("[loadRegions] same result, skipping state update");
+        return totalRegions > 0;
+      }
+      lastRegionsRef.current = { pageCount: nextPages.length, totalRegions };
       setPages(nextPages);
       setRegionsByPage(nextRegionsByPage);
-    };
+      return totalRegions > 0;
+    },
+    []
+  );
+
+  useEffect(() => {
     if (!currentTaskId) return;
     if (!progress) return;
     const stage = progress.stage;
@@ -916,13 +970,17 @@ export default function HomePage() {
       stage === "completed";
     if (!stageAfterLayout) return;
     if (stage === "completed") {
-      void loadLayout(currentTaskId);
+      void loadRegions(currentTaskId);
       return;
     }
-    if (pages.length === 0) {
-      void loadLayout(currentTaskId);
+    // 检查是否已有有效的 region 数据，而非仅检查 pages 是否存在
+    const hasAnyRegion = Object.values(regionsByPage).some(
+      (arr) => arr.length > 0
+    );
+    if (!hasAnyRegion) {
+      void loadRegions(currentTaskId);
     }
-  }, [currentTaskId, progress, pages.length]);
+  }, [currentTaskId, progress, regionsByPage, loadRegions]);
 
   useEffect(() => {
     if (!pdfUrl) return;
@@ -938,6 +996,7 @@ export default function HomePage() {
         return;
       }
       pdfDocRef.current = doc;
+      setPdfVersion((v) => v + 1);
     };
     void load();
     return () => {
@@ -1100,7 +1159,7 @@ export default function HomePage() {
                     setActiveReference({
                       documentId: r.documentId,
                       pageNumber: r.pageNumber,
-                      regionIds: r.regionIds,
+                      regionIds: getRegionIdsForPage(r.pageNumber),
                     });
                   }}
                   className="group block w-full rounded-xl border border-transparent bg-slate-50 px-3 py-2.5 text-left transition-all hover:border-indigo-100 hover:bg-indigo-50/50 hover:shadow-sm"
