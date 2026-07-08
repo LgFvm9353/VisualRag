@@ -425,9 +425,17 @@ export class IngestionPipeline {
     });
 
     // 2. 为每页/每段落创建 DocumentSection + Chunk + ChunkEmbedding
+    // 跳过内容过短的段落（如表格中的单个数字），避免产生无意义的检索结果
+    const MIN_CONTENT_LENGTH = 20;
+    let skippedShortCount = 0;
     for (let i = 0; i < textPages.length; i++) {
       const page = textPages[i];
       const cleanedText = sanitizePostgresText(page.text);
+
+      if (cleanedText.length < MIN_CONTENT_LENGTH) {
+        skippedShortCount++;
+        continue;
+      }
       const layout = layoutPages?.find((p) => p.pageNumber === page.pageNumber);
       const docxPara = docxParagraphs?.[i];
 

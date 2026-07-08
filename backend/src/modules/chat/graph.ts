@@ -103,7 +103,7 @@ export function buildChatGraph(
       ? (intent as typeof ChatState.State["intent"])
       : "simple_qa";
 
-    logger.debug({ query: state.query, intent: resolved }, "意图识别完成");
+    logger.info({ query: state.query.slice(0, 80), intent: resolved }, "[chat] classifyIntent 完成");
     return { intent: resolved };
   }
 
@@ -112,31 +112,124 @@ export function buildChatGraph(
       return { retrievedContext: "", citations: [] };
     }
 
+    // documentId 空值守卫
+    if (!state.documentId) {
+      logger.warn({ query: state.query.slice(0, 80) }, "[chat] retrieveContext: documentId 为空，跳过检索");
+      return { retrievedContext: "", citations: [], finished: true };
+    }
+
     // 检测文档类型（Word vs PDF），用于引用标签
     let sourceType = "pdf";
-    if (prisma && state.documentId) {
+    if (prisma) {
       try {
         const doc = await prisma.document.findUnique({
           where: { id: state.documentId },
           select: { fileType: true },
         });
         sourceType = doc?.fileType === "docx" ? "docx" : "pdf";
-      } catch {
-        // 查 DB 失败时默认 pdf
+      } catch (err: any) {
+        logger.warn({ err: err.message }, "[chat] retrieveContext: 查询文档类型失败");
       }
     }
+
+    const topK = state.intent === "complex_reasoning" ? 15 : 8;
+    logger.info(
+      { documentId: state.documentId, query: state.query.slice(0, 80), topK, sourceType },
+      "[chat] retrieveContext 开始检索",
+    );
 
     const results = await hybridSearch.search({
       documentIds: [state.documentId],
       query: state.query,
-      topK: state.intent === "complex_reasoning" ? 15 : 8,
+      topK,
     });
 
+    logger.info(
+      { resultCount: results.length, topK },
+      "[chat] retrieveContext 检索完成",
+    );
+
+    // 过滤掉内容过短的 chunk（如表格中的单个数字），避免 LLM 收到无意义上下文。
+    // CJK 字符信息密度远高于英文，5 个中文字符即可表达完整语义（如"本章小结"），
+    // 因此使用 CJK 感知的判定而非固定 20 字符阈值。
+    function isMeaningfulContent(text: string): boolean {
+      if (!text || text.trim().length === 0) return false;
+      const cjkCount = (text.match(/[一-鿿]/g) || []).length;
+      // CJK 为主且至少有 5 个中文字符
+      if (cjkCount >= 5) return true;
+      // 混合/英文：至少 15 字符
+      if (text.length >= 15) return true;
+      return false;
+    }
+    const meaningfulResults = results.filter(
+      (r) => isMeaningfulContent(r.fullContent || r.snippet),
+    );
+    if (meaningfulResults.length < results.length) {
+      logger.info(
+        { before: results.length, after: meaningfulResults.length },
+        "[chat] retrieveContext 过滤短内容",
+      );
+    }
+    // 打印前 2 条结果的前 120 字符，方便诊断内容质量
+    meaningfulResults.slice(0, 2).forEach((r, i) => {
+      logger.info(
+        { idx: i, page: r.pageNumber, similarity: r.similarity?.toFixed(4), preview: (r.fullContent || r.snippet).slice(0, 120) },
+        "[chat] retrieveContext 结果预览",
+      );
+    });
+
+    // 空检索：回退到从 DocumentSection 加载全文作为上下文，
+    // 避免 LLM 在无上下文的情况下生成"无法回答"的通用回复。
+    if (meaningfulResults.length === 0) {
+      logger.warn(
+        { documentId: state.documentId, query: state.query.slice(0, 80) },
+        "[chat] retrieveContext: 无有效检索结果，回退到全文上下文",
+      );
+
+      let fullContext = "";
+      if (prisma) {
+        try {
+          const sections = await prisma.documentSection.findMany({
+            where: { documentId: state.documentId },
+            orderBy: { index: "asc" },
+            select: { content: true },
+          });
+          const MAX_FALLBACK_CHARS = 8000;
+          const parts: string[] = [];
+          let totalChars = 0;
+          for (const s of sections) {
+            if (totalChars >= MAX_FALLBACK_CHARS) break;
+            parts.push(s.content);
+            totalChars += s.content.length;
+          }
+          fullContext = parts.join("\n\n");
+          if (totalChars >= MAX_FALLBACK_CHARS) {
+            fullContext = fullContext.slice(0, MAX_FALLBACK_CHARS) + "\n\n[文档过长，后续内容已截断]";
+          }
+          logger.info(
+            { sectionsCount: sections.length, totalChars },
+            "[chat] retrieveContext 全文回退加载完成",
+          );
+        } catch (err: any) {
+          logger.error({ err: err.message }, "[chat] retrieveContext 全文回退失败");
+        }
+      }
+
+      // 不设置 finished=true，让 generateAnswer 正常生成回答
+      return {
+        retrievedContext: fullContext
+          ? `[全文上下文 — 因检索未能匹配到具体段落，提供完整文档内容供参考]\n\n${fullContext}`
+          : "",
+        citations: [],
+        iterationCount: state.iterationCount + 1,
+      };
+    }
+
     const locationLabel = sourceType === "docx" ? "段落" : "页";
-    const contextPieces = results.map(
+    const contextPieces = meaningfulResults.map(
       (r, i) => `[片段 ${i + 1}] (第 ${r.pageNumber} ${locationLabel}):\n${r.fullContent || r.snippet}`,
     );
-    const citations = results.map((r) => ({
+    const citations = meaningfulResults.map((r) => ({
       pageNumber: r.pageNumber,
       chunkId: r.chunkId,
       snippet: r.snippet,
@@ -159,12 +252,27 @@ export function buildChatGraph(
       | ((token: string) => void)
       | undefined;
 
+    const ctxLen = (state.retrievedContext || "").length;
+    logger.info(
+      { intent: state.intent, contextLen: ctxLen, citationsCount: state.citations.length },
+      "[chat] generateAnswer 开始生成",
+    );
+    if (ctxLen > 0) {
+      logger.info(
+        { contextPreview: state.retrievedContext.slice(0, 300) },
+        "[chat] generateAnswer 上下文预览",
+      );
+    }
+
     const systemPrompt =
       state.intent === "chat"
         ? "你是一个友好的文档问答助手。用中文简洁回答用户的问题。"
-        : `你是一个文档问答助手，只能基于提供的文档片段回答问题。
-如果文档中没有相关信息，请明确说明无法从文档中回答。
-回答时用中文简要、清晰地总结要点。每次陈述都要标注来源（如"[片段 X]"）。`;
+        : `你是一个文档问答助手。**严格禁止**使用你自己的训练数据或外部知识，所有回答**必须且只能**基于提供的文档片段。
+
+规则：
+1. 如果文档中没有相关信息，直接回答"文档中未找到相关信息"，不要做任何猜测或补充。
+2. 引用来源时，必须在对应的具体内容**紧后面**标注（如"......。[片段 1]"），**禁止**单独出现"[片段 X]"这类无上下文依托的标记。
+3. 用中文简要、清晰地总结要点。`;
 
     const contextBlock = state.retrievedContext
       ? `\n\n文档片段：\n${state.retrievedContext}`
@@ -198,15 +306,27 @@ export function buildChatGraph(
       }
     }
 
-    // CRAG 自评：检查是否需要补充检索
+    // CRAG 自评：检查是否需要补充检索（基于真实检索结果，而非 LLM 答案）
     let needsMore = false;
     if (state.intent === "complex_reasoning" && state.iterationCount < 3) {
-      const finalAnswer = tokens.join("");
+      logger.info(
+        { iterationCount: state.iterationCount, citationsCount: state.citations.length },
+        "[chat] generateAnswer CRAG 自评",
+      );
       const decision = await cragService.evaluate(
         state.query,
-        [{ documentId: state.documentId, pageNumber: 1, snippet: finalAnswer, similarity: 1 }],
+        state.citations.map((c) => ({
+          documentId: state.documentId,
+          pageNumber: c.pageNumber,
+          snippet: c.snippet,
+          similarity: 0.5,
+        })),
       );
       needsMore = decision.action !== "accept";
+      logger.info(
+        { action: decision.action, reason: decision.reason?.slice(0, 100) },
+        "[chat] generateAnswer CRAG 结果",
+      );
     }
 
     return {

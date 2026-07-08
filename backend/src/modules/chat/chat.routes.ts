@@ -27,6 +27,19 @@ export const chatRoutes: FastifyPluginAsync<ChatPluginOptions> = async (app, opt
       limit: (request.query as any).limit,
     });
 
+    app.log.info(
+      { documentId: params.documentId, q: params.q.slice(0, 80) },
+      "[chat] 收到对话请求",
+    );
+    // 诊断日志：打印 query 前 8 个字符的 Unicode 码点，
+    // 帮助排查 URL 解码后中文是否被 GBK/UTF-8 混淆
+    if (params.q.length > 0) {
+      const hexPreview = Array.from(params.q.slice(0, 8))
+        .map((c) => `U+${c.codePointAt(0)!.toString(16).toUpperCase()}`)
+        .join(" ");
+      app.log.info({ qHex: hexPreview }, "[chat] query codepoints");
+    }
+
     const clientIp = request.ip;
     await chatRateLimiter(clientIp);
 
