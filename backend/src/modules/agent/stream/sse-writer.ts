@@ -1,4 +1,5 @@
 import type { FastifyReply } from "fastify";
+import type { OutgoingHttpHeaders } from "node:http";
 import { randomUUID } from "crypto";
 
 export class SseWriter {
@@ -11,8 +12,12 @@ export class SseWriter {
   ) {}
 
   open() {
+    const headers = Object.fromEntries(
+      Object.entries(this.reply.getHeaders()).filter((entry): entry is [string, string | number | string[]] => entry[1] !== undefined),
+    ) as OutgoingHttpHeaders;
     this.reply.hijack();
     this.reply.raw.writeHead(200, {
+      ...headers,
       "Content-Type": "text/event-stream; charset=utf-8",
       "Cache-Control": "no-cache, no-transform",
       Connection: "keep-alive",
