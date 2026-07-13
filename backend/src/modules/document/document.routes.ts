@@ -18,6 +18,19 @@ export const documentRoutes: FastifyPluginAsync<DocumentPluginOptions> = async (
   app,
   opts,
 ) => {
+  app.get("/documents/:id/source", async (request, reply) => {
+    const params = z.object({ id: z.string().uuid() }).parse(request.params);
+    const document = await opts.prisma.document.findUnique({
+      where: { id: params.id },
+      select: { id: true, fileName: true, fileType: true, status: true },
+    });
+    if (!document) {
+      reply.code(404).send({ error: "document_not_found" });
+      return;
+    }
+    reply.send(document);
+  });
+
   // ---- GET /documents/:id/sections ----
   app.get("/documents/:id/sections", async (request, reply) => {
     const schema = z.object({ id: z.string().uuid() });
@@ -44,10 +57,9 @@ export const documentRoutes: FastifyPluginAsync<DocumentPluginOptions> = async (
         .findUnique({ where: { id: params.id }, select: { fileType: true } })
         .then((d) => d?.fileType)) ??
       "pdf";
-    const isDocx = docType === "docx";
+    const isSectionBased = docType !== "pdf";
 
-    // Word 文档：从 DB 读取段落信息，每个段落映射为一个"page"
-    if (isDocx) {
+    if (isSectionBased) {
       const sections = await opts.prisma.documentSection.findMany({
         where: { documentId: params.id },
         orderBy: { index: "asc" },

@@ -10,16 +10,20 @@ datasource db {
 }
 
 // ============================================================
-// 文档（PDF + Word 统一）
+// 文档（多格式统一）
 // ============================================================
 
 model Document {
   id        String   @id @default(uuid())
   fileName  String
-  fileType  String   @default("pdf") // "pdf" | "docx"
-  fileSize  Int?                    // 字节
-  status    String   @default("processing") // "processing" | "ready" | "failed"
-  createdAt DateTime @default(now())
+  fileType  String   @default("pdf") // "pdf" | "docx" | "pptx" | "text" | "html"
+  fileSize     Int?                    // 字节
+  status       String   @default("processing") // "processing" | "ready" | "failed"
+  sourceLabel  String?
+  publishedAt  DateTime?
+  tags         String[] @default([])
+  metadataJson Json?
+  createdAt    DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   sections        DocumentSection[]
@@ -31,7 +35,7 @@ model Document {
 }
 
 // ============================================================
-// 文档段落（PDF 页面 / Word 章节，统一抽象）
+// 文档段落（PDF 页面 / Word 段落 / PPTX slide / 纯文本 section，统一抽象）
 // ============================================================
 
 model DocumentSection {
@@ -41,7 +45,7 @@ model DocumentSection {
   index       Int                   // 序号（PDF=pageNumber, Word=paragraphIndex）
   title       String?               // 章节/段落标题
   content     String                // 该段落原始文本
-  sourceType  String   @default("pdf") // "pdf" | "docx"
+  sourceType  String   @default("pdf") // "pdf" | "docx" | "pptx" | "text" | "html"
   // PDF 专用（Word 文档这些字段为 null）
   pageNumber  Int?
   pageWidth   Float?

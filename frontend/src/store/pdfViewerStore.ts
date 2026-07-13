@@ -5,7 +5,6 @@ export interface VisualReference {
   pageNumber: number;
   /** Word 文档的段落索引 */
   sectionIndex?: number;
-  regionIds: string[];
 }
 
 export interface PdfViewerState {

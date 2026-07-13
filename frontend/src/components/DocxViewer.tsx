@@ -63,12 +63,6 @@ const DOCX_CONTENT_CSS = `
   }
   .docx-content strong { font-weight: 600; color: #1e293b; }
   .docx-content em { font-style: italic; }
-  .docx-content [data-para-index].highlighted {
-    background: linear-gradient(90deg, rgba(99,102,241,0.12) 0%, rgba(99,102,241,0.06) 100%);
-    border-left: 3px solid #6366f1; padding-left: 0.75rem;
-    border-radius: 0 0.5rem 0.5rem 0; transition: background 0.3s ease;
-    scroll-margin-top: 3rem;
-  }
 `;
 
 /**
@@ -103,7 +97,7 @@ export const DocxViewer: FC<DocxViewerProps> = ({
     };
   }, []);
 
-  // 当 activeReference 变更时，高亮并滚动到对应段落
+  // 当 activeReference 变更时，滚动到对应段落
   useEffect(() => {
     if (!activeReference) return;
     if (activeReference.documentId !== documentId) return;
@@ -115,25 +109,12 @@ export const DocxViewer: FC<DocxViewerProps> = ({
     const content = contentRef.current;
     if (!content) return;
 
-    // 移除之前所有高亮（先清除样式，后添加新样式，避免重复重排）
-    const prevHighlighted = content.querySelectorAll(
-      "[data-para-index].highlighted",
-    );
-    prevHighlighted.forEach((el) => {
-      el.classList.remove("highlighted");
-    });
-
-    // 查找对应段落元素（data-para-index 属性由注入脚本设置，1-based 与后端 toTextPages 对齐）
     const target = content.querySelector(
       `[data-para-index="${sectionIndex}"]`,
     ) as HTMLElement | null;
     if (!target) return;
 
-    // 先添加高亮类，等浏览器完成布局后再滚动，避免 layout thrash 导致定位偏移
-    target.classList.add("highlighted");
     setCurrentPage(sectionIndex);
-
-    // 使用 requestAnimationFrame 确保 DOM 布局（重排）完成后再执行滚动
     requestAnimationFrame(() => {
       target.scrollIntoView({ behavior: "smooth", block: "center" });
     });

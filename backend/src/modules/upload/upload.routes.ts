@@ -7,7 +7,6 @@ import { createWriteStream } from "fs";
 import { promises as fs } from "fs";
 import type { IngestionPipeline } from "../../pipeline/ingestionPipeline.js";
 import type { PrismaClient } from "@prisma/client";
-import { uploadRateLimiter } from "../../server/plugins/rateLimit.js";
 import {
   loadUploadIndex,
   saveUploadIndex,
@@ -20,6 +19,7 @@ import {
   writeChunk,
   assembleFile,
 } from "./upload.service.js";
+import { resolveDocumentSourcePath } from "./source-path.js";
 
 /** 验证去重条目对应的 DB 文档是否已处理完成 */
 async function isDocumentReady(
@@ -40,6 +40,35 @@ async function isDocumentReady(
 interface UploadPluginOptions {
   pipeline: IngestionPipeline;
   prisma: PrismaClient;
+}
+
+function getContentType(fileType: string, sourcePath?: string) {
+  if (fileType === "docx" || sourcePath?.toLowerCase().endsWith(".docx")) {
+    return "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+  }
+  if (fileType === "pptx" || sourcePath?.toLowerCase().endsWith(".pptx")) {
+    return "application/vnd.openxmlformats-officedocument.presentationml.presentation";
+  }
+  if (fileType === "text" || sourcePath?.toLowerCase().endsWith(".txt") || sourcePath?.toLowerCase().endsWith(".md")) {
+    return "text/plain; charset=utf-8";
+  }
+  if (fileType === "html" || sourcePath?.toLowerCase().endsWith(".html") || sourcePath?.toLowerCase().endsWith(".htm")) {
+    return "text/html; charset=utf-8";
+  }
+  return "application/pdf";
+}
+
+function detectFileType(fileName: string): IngestionPipeline["createTask"] extends (params: infer P) => any
+  ? P extends { fileType: infer T }
+    ? T
+    : never
+  : never {
+  const lower = fileName.toLowerCase();
+  if (lower.endsWith(".docx")) return "docx" as any;
+  if (lower.endsWith(".pptx")) return "pptx" as any;
+  if (lower.endsWith(".txt") || lower.endsWith(".md")) return "text" as any;
+  if (lower.endsWith(".html") || lower.endsWith(".htm")) return "html" as any;
+  return "pdf" as any;
 }
 
 export const uploadRoutes: FastifyPluginAsync<UploadPluginOptions> = async (
@@ -91,6 +120,7 @@ export const uploadRoutes: FastifyPluginAsync<UploadPluginOptions> = async (
             documentId: existing.documentId,
             fileName: body.fileName,
             sourcePath: existing.sourcePath,
+            fileType: detectFileType(body.fileName),
           });
           reply.send({ fast: true, taskId: task.id, documentId: existing.documentId });
           return;
@@ -241,9 +271,7 @@ export const uploadRoutes: FastifyPluginAsync<UploadPluginOptions> = async (
       }
 
       // 创建处理任务
-      const fileType = metadata.fileName.toLowerCase().endsWith(".docx")
-        ? "docx"
-        : "pdf";
+      const fileType = detectFileType(metadata.fileName);
       const task = opts.pipeline.createTask({
         fileName: metadata.fileName,
         fileType,
@@ -268,95 +296,11 @@ export const uploadRoutes: FastifyPluginAsync<UploadPluginOptions> = async (
         documentId: result.documentId!,
         fileName: metadata.fileName,
         sourcePath: result.sourcePath!,
+        fileType: detectFileType(metadata.fileName),
       });
       reply.send({ taskId: task.id, documentId: result.documentId!, dedup: true });
     } else {
       reply.send({ taskId: result.taskId! });
-    }
-  });
-
-  // ---- POST /upload (legacy multipart) ----
-  app.post("/upload", async (request, reply) => {
-    await uploadRateLimiter(request.ip);
-    try {
-      const file = await (request as any).file();
-      if (!file) {
-        reply.code(400).send({ error: "file expected" });
-        return;
-      }
-      const fileName = file.filename || "file";
-      const uploadsDir = getUploadsDir();
-      await fs.mkdir(uploadsDir, { recursive: true });
-
-      // 先写临时文件，计算 hash 后做去重
-      const tmpPath = join(uploadsDir, `tmp-${randomUUID()}`);
-      const writeStream = createWriteStream(tmpPath);
-      await streamPipeline(file.file, writeStream);
-
-      // 计算文件 hash
-      const { createHash } = await import("crypto");
-      const fileData = await fs.readFile(tmpPath);
-      const fileHash = createHash("sha256").update(fileData).digest("hex");
-
-      // index 锁内做去重
-      const result = await withIndexLock(async () => {
-        const index = await loadUploadIndex();
-        const existing = index[fileHash];
-        if (existing?.documentId) {
-          // 验证 DB 中文档确实已完成处理
-          const ready = await isDocumentReady(opts.prisma, existing.documentId);
-          if (!ready) {
-            delete index[fileHash];
-          } else {
-            // 确认文件仍在磁盘上
-            let fileExists = false;
-            try {
-              await fs.access(existing.sourcePath);
-              fileExists = true;
-            } catch {
-              delete index[fileHash];
-            }
-            if (fileExists) {
-              await fs.unlink(tmpPath).catch(() => {});
-              await saveUploadIndex(index);
-              return { taskId: null as string | null, documentId: existing.documentId, sourcePath: existing.sourcePath, skipped: true };
-            }
-            // 文件不存在 → 清理过期条目，回退到正常入库
-          }
-        }
-
-        // 内容寻址：移动到 hash 文件名
-        const finalPath = join(uploadsDir, fileHash);
-        await fs.rename(tmpPath, finalPath);
-
-        const fileType = fileName.toLowerCase().endsWith(".docx")
-          ? "docx"
-          : "pdf";
-        const task = opts.pipeline.createTask({
-          fileName,
-          fileType,
-          sourcePath: finalPath,
-        });
-
-        index[fileHash] = { sourcePath: finalPath, documentId: task.id };
-        await saveUploadIndex(index);
-
-        return { taskId: task.id, documentId: null as string | null, sourcePath: null as string | null, skipped: false };
-      });
-
-      if (result.skipped) {
-        const task = opts.pipeline.createCompletedTask({
-          documentId: result.documentId!,
-          fileName,
-          sourcePath: result.sourcePath!,
-        });
-        reply.send({ taskId: task.id, documentId: result.documentId!, dedup: true });
-      } else {
-        reply.send({ taskId: result.taskId! });
-      }
-    } catch (err) {
-      app.log.error({ err }, "Upload failed");
-      reply.code(500).send({ error: "upload_failed" });
     }
   });
 
@@ -415,31 +359,25 @@ export const uploadRoutes: FastifyPluginAsync<UploadPluginOptions> = async (
     const schema = z.object({ id: z.string().uuid() });
     const params = schema.parse(request.params);
     const task = opts.pipeline.getTask(params.id);
-    if (!task) {
-      reply.code(404).send({ error: "not found" });
-      return;
-    }
-    if (!task.sourcePath) {
-      reply.code(404).send({ error: "task_has_no_file" });
+    const index = task ? {} : await loadUploadIndex();
+    const sourcePath = resolveDocumentSourcePath(params.id, task, Object.values(index));
+    if (!sourcePath) {
+      reply.code(404).send({ error: "file_source_not_found" });
       return;
     }
     try {
-      await fs.access(task.sourcePath);
+      await fs.access(sourcePath);
     } catch {
       reply.code(404).send({ error: "file_not_found_on_disk" });
       return;
     }
     const { createReadStream } = await import("fs");
-    const stream = createReadStream(task.sourcePath);
-    const isDocx =
-      task.fileType === "docx" ||
-      task.sourcePath?.toLowerCase().endsWith(".docx");
-    reply.header(
-      "Content-Type",
-      isDocx
-        ? "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-        : "application/pdf",
-    );
+    const stream = createReadStream(sourcePath);
+    const fileType = task?.fileType ?? (await opts.prisma.document.findUnique({
+      where: { id: params.id },
+      select: { fileType: true },
+    }))?.fileType ?? "pdf";
+    reply.header("Content-Type", getContentType(fileType, sourcePath));
     return reply.send(stream);
   });
 };

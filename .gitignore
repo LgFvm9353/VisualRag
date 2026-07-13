@@ -1,0 +1,8 @@
+# Local design and planning artifacts
+.docs/
+docs/
+.superpowers/
+.claude/
+
+# Temporary PPTX verification artifacts
+**/.tmp-pptx-check/

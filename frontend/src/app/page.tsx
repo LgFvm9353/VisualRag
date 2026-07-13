@@ -1,1375 +1,149 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import io, { type Socket } from "socket.io-client";
-import { PdfViewer, type PdfPageMetadata } from "@/components/PdfViewer";
-import { DocxViewer } from "@/components/DocxViewer";
-import type { VisualRegion as ViewerRegion } from "@/components/HighlightOverlay";
-import { usePdfViewerStore } from "@/store/pdfViewerStore";
+import { CitationPreviewPanel } from "@/components/CitationPreviewPanel";
+import { KnowledgeBaseAnswer } from "@/components/KnowledgeBaseAnswer";
 import {
-  getDocument,
-  GlobalWorkerOptions,
-  type PDFDocumentProxy,
-} from "pdfjs-dist";
-
-interface IngestionProgressEvent {
-  taskId: string;
-  stage:
-    | "queued"
-    | "extracting_text"
-    | "layout_analysis"
-    | "generating_text_embeddings"
-    | "generating_image_embeddings"
-    | "writing_database"
-    | "completed"
-    | "failed";
-  progress: number;
-  message?: string;
-}
-
-interface UploadResponse {
-  taskId: string;
-}
-
-interface LayoutRegion {
-  id: string;
-  pageNumber: number;
-  bbox: {
-    x0: number;
-    y0: number;
-    x1: number;
-    y1: number;
-  };
-}
-
-interface LayoutPage {
-  pageNumber: number;
-  width: number;
-  height: number;
-  regions: LayoutRegion[];
-}
-
-interface LayoutResponse {
-  taskId: string;
-  pages: LayoutPage[];
-}
-
-interface DocumentRegionsPage {
-  pageNumber: number;
-  width: number;
-  height: number;
-  regions: {
-    id: string;
-    pageNumber: number;
-    type: string;
-    bbox: {
-      x0: number;
-      y0: number;
-      x1: number;
-      y1: number;
-    };
-  }[];
-}
-
-interface DocumentRegionsResponse {
-  documentId: string;
-  pages: DocumentRegionsPage[];
-}
-
-interface ChatMessage {
-  id: string;
-  role: "user" | "assistant";
-  content: string;
-  citations?: {
-    pageNumber: number;
-    regionIds: string[];
-    snippet?: string;
-  }[];
-}
-
-interface ChatEventPayload {
-  type: "token" | "done" | "error";
-  token?: string;
-  citations?: {
-    pageNumber: number;
-    regionIds: string[];
-    snippet?: string;
-  }[];
-  message?: string;
-}
-
-interface UploadInitResponseFast {
-  fast: true;
-  taskId: string;
-}
-
-interface UploadInitResponseNormal {
-  fast: false;
-  uploadId: string;
-  uploadedChunks: number[];
-  chunkSize: number;
-  totalChunks: number;
-}
-
-type UploadInitResponse = UploadInitResponseFast | UploadInitResponseNormal;
-
-const backendUrl =
-  process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:4000";
-
-type HashWorkerRequest = {
-  type: "hash";
-  requestId: string;
-  file: File;
-  chunkSize: number;
-};
-
-type HashWorkerResponse =
-  | {
-      type: "done";
-      requestId: string;
-      hash: string;
-    }
-  | {
-      type: "error";
-      requestId: string;
-      message: string;
-    };
-
-let hashWorkerInstance: Worker | null = null;
-const hashWorkerPending = new Map<
-  string,
-  { resolve: (hash: string) => void; reject: (err: Error) => void }
->();
-
-function getHashWorker() {
-  if (hashWorkerInstance) return hashWorkerInstance;
-  const worker = new Worker(new URL("../workers/hashWorker.ts", import.meta.url));
-  worker.addEventListener("message", (event: MessageEvent<HashWorkerResponse>) => {
-    const data = event.data;
-    if (!data || !data.requestId) return;
-    const pending = hashWorkerPending.get(data.requestId);
-    if (!pending) return;
-    if (data.type === "done") {
-      hashWorkerPending.delete(data.requestId);
-      pending.resolve(data.hash);
-      return;
-    }
-    if (data.type === "error") {
-      hashWorkerPending.delete(data.requestId);
-      pending.reject(new Error(data.message || "hash_failed"));
-    }
-  });
-  worker.addEventListener("error", () => {
-    for (const [requestId, pending] of hashWorkerPending) {
-      hashWorkerPending.delete(requestId);
-      pending.reject(new Error("hash_worker_failed"));
-    }
-  });
-  hashWorkerInstance = worker;
-  return worker;
-}
-
-async function computeFileHash(file: File): Promise<string> {
-  const worker = getHashWorker();
-  const requestId = globalThis.crypto.randomUUID();
-  const chunkSize = 4 * 1024 * 1024;
-  const message: HashWorkerRequest = { type: "hash", requestId, file, chunkSize };
-  return new Promise((resolve, reject) => {
-    hashWorkerPending.set(requestId, { resolve, reject });
-    worker.postMessage(message);
-  });
-}
-
-interface UploadResult {
-  taskId: string;
-  fast: boolean;
-}
-
-async function uploadFileLegacy(file: File): Promise<UploadResult> {
-  const formData = new FormData();
-  formData.append("file", file);
-  const res = await fetch(`${backendUrl}/upload`, {
-    method: "POST",
-    body: formData,
-  });
-  if (!res.ok) {
-    throw new Error("upload_failed");
-  }
-  const data = (await res.json()) as UploadResponse & { dedup?: boolean };
-  return { taskId: data.taskId, fast: data.dedup === true };
-}
-
-async function readResponseErrorCode(res: Response) {
-  try {
-    const json = (await res.json()) as { error?: unknown; message?: unknown };
-    if (typeof json?.error === "string") return json.error;
-    if (typeof json?.message === "string") return json.message;
-    return null;
-  } catch {
-    return null;
-  }
-}
-
-async function uploadFileWithResume(file: File): Promise<UploadResult> {
-  const hash = await computeFileHash(file);
-  const storageKey = `visualrag_upload_${hash}`;
-  let existingUploadId: string | undefined;
-  try {
-    const stored = globalThis.localStorage?.getItem(storageKey);
-    if (stored) {
-      const parsed = JSON.parse(stored) as { uploadId?: string };
-      if (parsed.uploadId) {
-        existingUploadId = parsed.uploadId;
-      }
-    }
-  } catch {
-  }
-  const defaultChunkSize = 5 * 1024 * 1024;
-  const initRes = await fetch(`${backendUrl}/upload/init`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      fileName: file.name,
-      fileSize: file.size,
-      hash,
-      chunkSize: defaultChunkSize,
-      existingUploadId,
-    }),
-  });
-  if (!initRes.ok) {
-    const code = await readResponseErrorCode(initRes);
-    throw new Error(code ? `upload_init_failed:${code}` : "upload_init_failed");
-  }
-  const initData = (await initRes.json()) as UploadInitResponse;
-  if (initData.fast) {
-    return { taskId: initData.taskId, fast: true };
-  }
-  let uploadId = initData.uploadId;
-  try {
-    globalThis.localStorage?.setItem(
-      storageKey,
-      JSON.stringify({ uploadId })
-    );
-  } catch {
-  }
-  const uploadedSet = new Set(initData.uploadedChunks);
-  let totalChunks = initData.totalChunks;
-  let chunkSize = initData.chunkSize || defaultChunkSize;
-  const uploadIndices = async (indices: number[]) => {
-    if (indices.length === 0) return;
-    const abort = new AbortController();
-    const maxConcurrency = 3;
-    let running = 0;
-    let cursor = 0;
-    const uploadChunk = async (index: number) => {
-      const start = index * chunkSize;
-      const end = Math.min(file.size, start + chunkSize);
-      const chunk = file.slice(start, end);
-      const res = await fetch(
-        `${backendUrl}/upload/chunk?uploadId=${encodeURIComponent(uploadId)}&index=${index}`,
-        {
-          method: "PUT",
-          headers: {
-            "Content-Type": "application/octet-stream",
-          },
-          body: chunk,
-          signal: abort.signal,
-        }
-      );
-      if (!res.ok) {
-        const code = await readResponseErrorCode(res);
-        throw new Error(code ? `upload_chunk_failed:${code}` : "upload_chunk_failed");
-      }
-    };
-    await new Promise<void>((resolve, reject) => {
-      const next = () => {
-        if (cursor >= indices.length && running === 0) {
-          resolve();
-          return;
-        }
-        while (running < maxConcurrency && cursor < indices.length) {
-          const index = indices[cursor++];
-          running += 1;
-          uploadChunk(index)
-            .then(() => {
-              running -= 1;
-              next();
-            })
-            .catch((err) => {
-              abort.abort();
-              reject(err);
-            });
-        }
-      };
-      next();
-    });
-  };
-
-  const initialMissing: number[] = [];
-  for (let index = 0; index < totalChunks; index++) {
-    if (!uploadedSet.has(index)) initialMissing.push(index);
-  }
-  await uploadIndices(initialMissing);
-
-  let completeData: UploadResponse | null = null;
-  for (let attempt = 0; attempt < 3; attempt++) {
-    const completeRes = await fetch(`${backendUrl}/upload/complete`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ uploadId }),
-    });
-    if (completeRes.ok) {
-      completeData = (await completeRes.json()) as UploadResponse;
-      break;
-    }
-    const code = await readResponseErrorCode(completeRes);
-    if (code !== "chunks_incomplete") {
-      throw new Error(code ? `upload_complete_failed:${code}` : "upload_complete_failed");
-    }
-    const refreshRes = await fetch(`${backendUrl}/upload/init`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        fileName: file.name,
-        fileSize: file.size,
-        hash,
-        chunkSize: defaultChunkSize,
-        existingUploadId: uploadId,
-      }),
-    });
-    if (!refreshRes.ok) {
-      const refreshCode = await readResponseErrorCode(refreshRes);
-      throw new Error(
-        refreshCode ? `upload_init_failed:${refreshCode}` : "upload_init_failed"
-      );
-    }
-    const refreshData = (await refreshRes.json()) as UploadInitResponse;
-    if (refreshData.fast) {
-      return { taskId: refreshData.taskId, fast: true };
-    }
-    totalChunks = refreshData.totalChunks;
-    chunkSize = refreshData.chunkSize || chunkSize;
-    if (refreshData.uploadId !== uploadId) {
-      uploadId = refreshData.uploadId;
-      try {
-        globalThis.localStorage?.setItem(
-          storageKey,
-          JSON.stringify({ uploadId })
-        );
-      } catch {
-      }
-    }
-    const refreshedSet = new Set(refreshData.uploadedChunks);
-    const missing: number[] = [];
-    for (let index = 0; index < refreshData.totalChunks; index++) {
-      if (!refreshedSet.has(index)) missing.push(index);
-    }
-    await uploadIndices(missing);
-  }
-
-  if (!completeData) {
-    throw new Error("upload_complete_failed:chunks_incomplete");
-  }
-  try {
-    globalThis.localStorage?.removeItem(storageKey);
-  } catch {
-  }
-  const resp = completeData as UploadResponse & { dedup?: boolean };
-  return { taskId: resp.taskId, fast: resp.dedup === true };
-}
-
-/** 检查文件是否为支持的格式（PDF 或 Word） */
-function isAcceptedFile(file: File): boolean {
-  const isPdf =
-    file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf");
-  const isDocx =
-    file.type ===
-      "application/vnd.openxmlformats-officedocument.wordprocessingml.document" ||
-    file.name.toLowerCase().endsWith(".docx");
-  return isPdf || isDocx;
-}
-
-/** 根据文件名检测文档类型 */
-function detectDocType(fileName: string): "pdf" | "docx" {
-  return fileName.toLowerCase().endsWith(".docx") ? "docx" : "pdf";
-}
-
-/** 加载 Word 文档 HTML，带重试 */
-async function loadDocxHtml(
-  documentId: string,
-  maxRetries = 3,
-): Promise<string | null> {
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    try {
-      const res = await fetch(`${backendUrl}/documents/${documentId}/html`);
-      if (res.ok) return await res.text();
-      // 404 不重试（HTML 根本不存在）
-      if (res.status === 404) return null;
-    } catch {
-      // 网络错误，继续重试
-    }
-    if (attempt < maxRetries) {
-      await new Promise((r) => setTimeout(r, 1000 * attempt)); // 递增等待
-    }
-  }
-  return null;
-}
+  askKnowledgeBase,
+  listKnowledgeBaseDocuments,
+  uploadKnowledgeBaseDocument,
+  type AskKnowledgeBaseResponse,
+  type KnowledgeBaseCitation,
+  type KnowledgeBaseDocument,
+} from "@/lib/knowledgeBaseApi";
 
 export default function HomePage() {
-  const [socket, setSocket] = useState<Socket | null>(null);
-  const [currentTaskId, setCurrentTaskId] = useState<string | null>(null);
-  const [progress, setProgress] = useState<IngestionProgressEvent | null>(null);
+  const [documents, setDocuments] = useState<KnowledgeBaseDocument[]>([]);
+  const [query, setQuery] = useState("");
+  const [result, setResult] = useState<AskKnowledgeBaseResponse | null>(null);
+  const [citation, setCitation] = useState<KnowledgeBaseCitation | null>(null);
+  const [loading, setLoading] = useState(false);
   const [uploading, setUploading] = useState(false);
-  const [pages, setPages] = useState<PdfPageMetadata[]>([]);
-  const [regionsByPage, setRegionsByPage] = useState<Record<number, ViewerRegion[]>>({});
-  const [viewerDocumentId, setViewerDocumentId] = useState<string | null>(null);
-  const [pdfUrl, setPdfUrl] = useState<string | null>(null);
-  const [docxHtml, setDocxHtml] = useState<string | null>(null);
-  const [docxHtmlError, setDocxHtmlError] = useState(false);
-  const [documentType, setDocumentType] = useState<"pdf" | "docx" | null>(null);
-  const pdfDocRef = useRef<PDFDocumentProxy | null>(null);
-  const [pdfVersion, setPdfVersion] = useState(0);
-  const [chatInput, setChatInput] = useState("");
-  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
-  const [chatStreaming, setChatStreaming] = useState(false);
-  const [chatError, setChatError] = useState<string | null>(null);
-  const [uploadError, setUploadError] = useState<string | null>(null);
-  const chatListRef = useRef<HTMLDivElement | null>(null);
-  const [speechSupported, setSpeechSupported] = useState(false);
-  const [recognizing, setRecognizing] = useState(false);
-  const recognitionRef = useRef<any | null>(null);
-  const mainUploadInputRef = useRef<HTMLInputElement | null>(null);
-  const renderTasksRef = useRef<Record<number, any>>({});
-  const pageRenderQueueRef = useRef<Record<number, Promise<void>>>({});
+  const [error, setError] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
-  const renderPdfPage = useCallback(
-    (page: PdfPageMetadata, canvasRef: { current: HTMLCanvasElement | null }) => {
-      const run = async () => {
-        const pdfDoc = pdfDocRef.current;
-        const canvas = canvasRef.current;
-        if (!pdfDoc || !canvas) return;
-
-        let pageObj: any;
-        try {
-          pageObj = await pdfDoc.getPage(page.pageNumber);
-        } catch (err: any) {
-          const msg = String(err?.message || "");
-          if (msg.includes("RenderingCancelledException")) {
-            return;
-          }
-          throw err;
-        }
-
-        const baseViewport = pageObj.getViewport({ scale: 1 });
-        const scale = page.width / baseViewport.width;
-        const viewport = pageObj.getViewport({ scale });
-        const ctx = canvas.getContext("2d");
-        if (!ctx) return;
-        canvas.width = viewport.width;
-        canvas.height = viewport.height;
-        ctx.clearRect(0, 0, viewport.width, viewport.height);
-
-        let renderTask: any;
-        try {
-          renderTask = pageObj.render({
-            canvasContext: ctx,
-            viewport,
-          } as any);
-        } catch (err: any) {
-          const msg = String(err?.message || "");
-          if (msg.includes("Cannot use the same canvas during multiple render() operations")) {
-            return;
-          }
-          throw err;
-        }
-
-        renderTasksRef.current[page.pageNumber] = renderTask;
-
-        try {
-          await renderTask.promise;
-        } catch (err: any) {
-          const msg = String(err?.message || "");
-          if (
-            msg.includes("RenderingCancelledException") ||
-            msg.includes("Cannot use the same canvas during multiple render() operations")
-          ) {
-            return;
-          }
-          throw err;
-        }
-      };
-
-      const prev = pageRenderQueueRef.current[page.pageNumber] || Promise.resolve();
-
-      const next = prev
-        .catch((err: any) => {
-          const msg = String(err?.message || "");
-          if (
-            msg.includes("RenderingCancelledException") ||
-            msg.includes("Cannot use the same canvas during multiple render() operations")
-          ) {
-            return;
-          }
-          throw err;
-        })
-        .then(run);
-
-      pageRenderQueueRef.current[page.pageNumber] = next;
-      return next;
-    },
-    [pdfVersion]
-  );
-
-  const setActiveReference = usePdfViewerStore((s) => s.setActiveReference);
-
-  const getRegionIdsForPage = (pageNumber: number, snippet?: string): string[] => {
-    const regions = regionsByPage[pageNumber] || [];
-    if (!snippet || regions.length === 0) return regions.map((r) => r.id);
-
-    // 将 snippet 拆分为有意义的词，匹配 region 的 textSnippet
-    const keywords = snippet
-      .split(/\s+/)
-      .filter((k) => k.length > 1);
-    if (keywords.length === 0) return regions.map((r) => r.id);
-
-    const ids = regions
-      .filter((r) => {
-        const text = (r as any).textSnippet || "";
-        if (!text) return false;
-        return keywords.some((kw) => text.includes(kw));
-      })
-      .map((r) => r.id);
-
-    console.log(
-      "[getRegionIdsForPage] page",
-      pageNumber,
-      "snippet keywords:",
-      keywords.length,
-      "→ matched",
-      ids.length,
-      "/",
-      regions.length,
-      "regions"
-    );
-    return ids;
-  };
-
-  useEffect(() => {
-    const s = io(backendUrl);
-    setSocket(s);
-    return () => {
-      s.disconnect();
-    };
-  }, []);
-
-  useEffect(() => {
-    if (!socket) return;
-    const handler = (event: IngestionProgressEvent) => {
-      lastSocketProgressTs.current = Date.now();
-      setProgress(event);
-    };
-    socket.on("ingestion:progress", handler);
-    return () => {
-      socket.off("ingestion:progress", handler);
-    };
-  }, [socket]);
-
-  // Word 文档完成处理时自动加载 HTML
-  useEffect(() => {
-    if (
-      documentType !== "docx" ||
-      !viewerDocumentId ||
-      progress?.stage !== "completed"
-    ) {
-      return;
-    }
-    let cancelled = false;
-    setDocxHtmlError(false);
-    loadDocxHtml(viewerDocumentId).then((html) => {
-      if (cancelled) return;
-      if (html) {
-        setDocxHtml(html);
-        setDocxHtmlError(false);
-      } else {
-        setDocxHtmlError(true);
-      }
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, [documentType, viewerDocumentId, progress?.stage]);
-
-  // Word 文档处理失败时显示错误（而非永久 loading）
-  useEffect(() => {
-    if (
-      documentType !== "docx" ||
-      !viewerDocumentId ||
-      progress?.stage !== "failed"
-    ) {
-      return;
-    }
-    setDocxHtmlError(true);
-  }, [documentType, viewerDocumentId, progress?.stage]);
-
-  useEffect(() => {
-    const w = globalThis as any;
-    const Rec = w.SpeechRecognition || w.webkitSpeechRecognition;
-    if (!Rec) {
-      setSpeechSupported(false);
-      return;
-    }
-    const instance = new Rec();
-    instance.lang = "zh-CN";
-    instance.interimResults = false;
-    instance.maxAlternatives = 1;
-    instance.onresult = (event: any) => {
-      const results = event.results;
-      if (!results || results.length === 0) {
-        return;
-      }
-      const firstResult = results[0];
-      if (!firstResult || firstResult.length === 0) {
-        return;
-      }
-      const transcript = String(firstResult[0].transcript || "");
-      if (!transcript.trim()) {
-        return;
-      }
-      setChatInput((prev) =>
-        prev && prev.trim().length > 0
-          ? `${prev.trim()}\n${transcript}`
-          : transcript
-      );
-    };
-    instance.onerror = () => {
-      setRecognizing(false);
-    };
-    instance.onend = () => {
-      setRecognizing(false);
-    };
-    recognitionRef.current = instance;
-    setSpeechSupported(true);
-    return () => {
-      if (recognitionRef.current) {
-        try {
-          recognitionRef.current.stop();
-        } catch {
-        }
-      }
-      recognitionRef.current = null;
-    };
-  }, []);
-
-  const progressPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  /** Socket.IO 最近一次进度更新时间戳，用于防止 HTTP 轮询用过期值覆盖 */
-  const lastSocketProgressTs = useRef(0);
-
-  // 组件卸载时清理轮询
-  useEffect(() => {
-    return () => {
-      if (progressPollRef.current) {
-        clearInterval(progressPollRef.current);
-      }
-    };
-  }, []);
-
-  const handleUpload = async (file: File) => {
-    setUploading(true);
-    setProgress(null);
-    setUploadError(null);
-    // 清理上一次的数据
-    setPdfUrl(null);
-    setDocxHtml(null);
-    setDocxHtmlError(false);
-    setPages([]);
-    setRegionsByPage({});
-    if (pdfDocRef.current) {
-      pdfDocRef.current.destroy().catch(() => {});
-      pdfDocRef.current = null;
-    }
-    // 清理上一次的轮询
-    if (progressPollRef.current) {
-      clearInterval(progressPollRef.current);
-      progressPollRef.current = null;
-    }
-    const docType = detectDocType(file.name);
-    setDocumentType(docType);
+  const refreshDocuments = useCallback(async () => {
     try {
-      const result = await uploadFileWithResume(file);
-      setCurrentTaskId(result.taskId);
-      setViewerDocumentId(result.taskId);
-      if (docType === "pdf") {
-        setPdfUrl(`${backendUrl}/files/${result.taskId}`);
-      }
-      if (socket) {
-        socket.emit("join-task", result.taskId);
-      }
-      if (result.fast) {
-        // 秒传：任务已瞬间完成，直接设置进度，无需等 Socket.IO 事件
-        setProgress({
-          taskId: result.taskId,
-          stage: "completed",
-          progress: 100,
-          message: "completed",
-        });
-      } else {
-        // HTTP 轮询 fallback：Socket.IO 可能错过事件，用 HTTP 确保 progress 被设置
-        const poll = async () => {
-          try {
-            // 如果 Socket.IO 在 3 秒内有更新，跳过本次轮询，
-            // 避免用过期的 task.progress 覆盖 Socket.IO 推送的实时进度
-            if (Date.now() - lastSocketProgressTs.current < 3000) {
-              return;
-            }
-            const res = await fetch(`${backendUrl}/tasks/${result.taskId}`);
-            if (!res.ok) return;
-            const task = (await res.json()) as {
-              id: string;
-              stage: string;
-              progress: number;
-            };
-            setProgress({
-              taskId: task.id,
-              stage: task.stage as IngestionProgressEvent["stage"],
-              progress: task.progress,
-              message: task.stage,
-            });
-            if (task.stage === "completed" || task.stage === "failed") {
-              if (progressPollRef.current) {
-                clearInterval(progressPollRef.current);
-                progressPollRef.current = null;
-              }
-            }
-          } catch {
-            // 网络错误，继续重试
-          }
-        };
-        poll(); // 立即查一次
-        progressPollRef.current = setInterval(poll, 1500);
-      }
-    } catch (error) {
-      console.error("Upload error", error);
-      const message =
-        error instanceof Error && error.message
-          ? error.message
-          : "上传失败，请检查网络或后端服务。";
-      setUploadError(message);
+      setDocuments(await listKnowledgeBaseDocuments());
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "knowledge_base_load_failed");
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshDocuments();
+  }, [refreshDocuments]);
+
+  async function handleAsk() {
+    const value = query.trim();
+    if (!value) return;
+    setLoading(true);
+    setError(null);
+    try {
+      setResult(await askKnowledgeBase({ query: value }));
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "knowledge_base_ask_failed");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function handleUpload(file: File) {
+    setUploading(true);
+    setError(null);
+    try {
+      await uploadKnowledgeBaseDocument(file);
+      await refreshDocuments();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "upload_failed");
     } finally {
       setUploading(false);
+      if (fileInputRef.current) fileInputRef.current.value = "";
     }
-  };
-
-  const handleChatSubmit = () => {
-    setChatError(null);
-    const q = chatInput.trim();
-    if (!q) return;
-    if (chatStreaming) return;
-    // 无文档时使用零 UUID 作为占位，允许纯闲聊对话
-    const documentId = viewerDocumentId || "00000000-0000-0000-0000-000000000000";
-    const userMessage: ChatMessage = {
-      id: `${Date.now()}-user`,
-      role: "user",
-      content: q,
-    };
-    const assistantId = `${Date.now()}-assistant`;
-    const assistantMessage: ChatMessage = {
-      id: assistantId,
-      role: "assistant",
-      content: "",
-    };
-    setChatMessages((prev) => [...prev, userMessage, assistantMessage]);
-    setChatInput("");
-    setChatStreaming(true);
-
-    // SSE 超时保护：30 秒无响应则自动关闭，防止 chatStreaming 卡死
-    let timeoutId: ReturnType<typeof setTimeout> | null = setTimeout(() => {
-      if (timeoutId === null) return; // 已清理
-      timeoutId = null;
-      es.close();
-      setChatStreaming(false);
-      setChatError("对话超时，请重试");
-      setChatMessages((prev) => {
-        const next = [...prev];
-        const index = next.findIndex((m) => m.id === assistantId);
-        if (index === -1) return prev;
-        if (next[index].content.trim().length === 0) {
-          next[index] = { ...next[index], content: "对话超时，请重试" };
-        }
-        return next;
-      });
-    }, 30_000);
-
-    const url = new URL(`${backendUrl}/chat/stream`);
-    url.searchParams.set("documentId", documentId);
-    url.searchParams.set("q", q);
-    const es = new EventSource(url.toString());
-
-    const clearTimeout_ = () => {
-      if (timeoutId !== null) {
-        clearTimeout(timeoutId);
-        timeoutId = null;
-      }
-    };
-
-    es.onmessage = (event) => {
-      clearTimeout_(); // 每次收到消息重置超时
-      try {
-        const data = JSON.parse(event.data) as ChatEventPayload;
-        if (data.type === "token" && data.token) {
-          setChatMessages((prev) => {
-            const next = [...prev];
-            const index = next.findIndex((m) => m.id === assistantId);
-            if (index === -1) {
-              return prev;
-            }
-            next[index] = {
-              ...next[index],
-              content: next[index].content + data.token,
-            };
-            return next;
-          });
-        }
-        if (data.type === "done") {
-          clearTimeout_();
-          if (data.citations && data.citations.length > 0 && viewerDocumentId) {
-            const first = data.citations[0];
-            setActiveReference({
-              documentId: viewerDocumentId,
-              pageNumber: first.pageNumber,
-              regionIds:
-                documentType === "docx"
-                  ? []
-                  : getRegionIdsForPage(first.pageNumber, first.snippet),
-            });
-          }
-          if (data.citations && data.citations.length > 0) {
-            setChatMessages((prev) => {
-              const next = [...prev];
-              const index = next.findIndex((m) => m.id === assistantId);
-              if (index === -1) {
-                return prev;
-              }
-              next[index] = {
-                ...next[index],
-                citations: data.citations,
-              };
-              return next;
-            });
-          }
-          setChatStreaming(false);
-          es.close();
-          return;
-        }
-        if (data.type === "error") {
-          clearTimeout_();
-          setChatMessages((prev) => {
-            const next = [...prev];
-            const index = next.findIndex((m) => m.id === assistantId);
-            if (index === -1) {
-              return prev;
-            }
-            if (next[index].content.trim().length === 0) {
-              next[index] = {
-                ...next[index],
-                content:
-                  data.message && data.message.trim().length > 0
-                    ? `对话生成失败：${data.message}`
-                    : "对话生成失败，请稍后重试或检查后端服务配置。",
-              };
-            }
-            return next;
-          });
-          if (data.message && data.message.trim().length > 0) {
-            setChatError(data.message);
-          }
-          setChatStreaming(false);
-          es.close();
-        }
-      } catch {
-        setChatMessages((prev) => {
-          const next = [...prev];
-          const index = next.findIndex((m) => m.id === assistantId);
-          if (index === -1) {
-            return prev;
-          }
-          if (next[index].content.trim().length === 0) {
-            next[index] = {
-              ...next[index],
-              content: "对话流解析失败，请稍后重试。",
-            };
-          }
-          return next;
-        });
-        setChatStreaming(false);
-        es.close();
-      }
-    };
-    es.onerror = () => {
-      clearTimeout_();
-      setChatMessages((prev) => {
-        const next = [...prev];
-        const index = next.findIndex((m) => m.id === assistantId);
-        if (index === -1) {
-          return prev;
-        }
-        if (next[index].content.trim().length === 0) {
-          next[index] = {
-            ...next[index],
-            content: "对话连接中断，请检查网络或后端服务。",
-          };
-        }
-        return next;
-      });
-      setChatStreaming(false);
-      es.close();
-    };
-  };
-
-  const handleResetChat = () => {
-    setChatMessages([]);
-    setChatInput("");
-    setChatError(null);
-  };
-
-  const handleToggleVoiceInput = () => {
-    if (!speechSupported) return;
-    const rec = recognitionRef.current;
-    if (!rec) return;
-    if (recognizing) {
-      try {
-        rec.stop();
-      } catch {
-      }
-      setRecognizing(false);
-      return;
-    }
-    try {
-      rec.start();
-      setRecognizing(true);
-    } catch {
-    }
-  };
-
-  useEffect(() => {
-    const el = chatListRef.current;
-    if (!el) return;
-    if (chatMessages.length === 0) return;
-    el.scrollTop = el.scrollHeight;
-  }, [chatMessages.length]);
-
-
-  const lastRegionsRef = useRef<{ pageCount: number; totalRegions: number; hasTextSnippet: boolean }>({
-    pageCount: -1,
-    totalRegions: -1,
-    hasTextSnippet: false,
-  });
-
-  const loadRegions = useCallback(
-    async (taskId: string) => {
-      console.log("[loadRegions] fetching", taskId);
-      const res = await fetch(`${backendUrl}/documents/${taskId}/regions`);
-      if (!res.ok) {
-        console.log("[loadRegions] failed status", res.status);
-        return false;
-      }
-      const data = (await res.json()) as DocumentRegionsResponse;
-      const nextPages: PdfPageMetadata[] = data.pages.map((p) => ({
-        pageNumber: p.pageNumber,
-        width: p.width,
-        height: p.height,
-      }));
-      const nextRegionsByPage: Record<number, ViewerRegion[]> = {};
-      let totalRegions = 0;
-      data.pages.forEach((p) => {
-        nextRegionsByPage[p.pageNumber] = p.regions.map((r) => ({
-          id: r.id,
-          type: r.type,
-          bbox: r.bbox,
-          textSnippet: (r as any).textSnippet || "",
-        }));
-        totalRegions += p.regions.length;
-      });
-      console.log(
-        "[loadRegions] loaded",
-        nextPages.length,
-        "pages,",
-        totalRegions,
-        "regions"
-      );
-      // 避免死循环：如果结果与上次相同，跳过状态更新
-      // 但当旧数据无 textSnippet 而新数据有时，允许更新
-      const nextHasTextSnippet = Object.values(nextRegionsByPage).some((arr) =>
-        arr.some((r) => !!(r as any).textSnippet)
-      );
-      const improved = !lastRegionsRef.current.hasTextSnippet && nextHasTextSnippet;
-      if (
-        lastRegionsRef.current.pageCount === nextPages.length &&
-        lastRegionsRef.current.totalRegions === totalRegions &&
-        !improved
-      ) {
-        console.log("[loadRegions] same result, skipping state update");
-        return totalRegions > 0;
-      }
-      lastRegionsRef.current = {
-        pageCount: nextPages.length,
-        totalRegions,
-        hasTextSnippet: nextHasTextSnippet,
-      };
-      setPages(nextPages);
-      setRegionsByPage(nextRegionsByPage);
-      return totalRegions > 0;
-    },
-    []
-  );
-
-  useEffect(() => {
-    if (!currentTaskId) return;
-    if (!progress) return;
-    // Word 文档不需要 PDF layout regions，跳过
-    if (documentType === "docx") return;
-    const stage = progress.stage;
-    const stageAfterLayout =
-      stage === "layout_analysis" ||
-      stage === "generating_text_embeddings" ||
-      stage === "generating_image_embeddings" ||
-      stage === "writing_database" ||
-      stage === "completed";
-    if (!stageAfterLayout) return;
-    if (stage === "completed") {
-      void loadRegions(currentTaskId);
-      return;
-    }
-    // 检查是否已有有效的 region 数据，而非仅检查 pages 是否存在
-    const hasAnyRegion = Object.values(regionsByPage).some(
-      (arr) => arr.length > 0
-    );
-    if (!hasAnyRegion) {
-      void loadRegions(currentTaskId);
-    }
-  }, [currentTaskId, progress, regionsByPage, loadRegions, documentType]);
-
-  useEffect(() => {
-    if (!pdfUrl) return;
-    GlobalWorkerOptions.workerSrc =
-      GlobalWorkerOptions.workerSrc ||
-      "https://unpkg.com/pdfjs-dist@4.10.38/build/pdf.worker.min.mjs";
-    let cancelled = false;
-    const load = async () => {
-      const loadingTask = getDocument(pdfUrl);
-      const doc = (await loadingTask.promise) as PDFDocumentProxy;
-      if (cancelled) {
-        await doc.destroy();
-        return;
-      }
-      pdfDocRef.current = doc;
-      setPdfVersion((v) => v + 1);
-    };
-    void load();
-    return () => {
-      cancelled = true;
-    };
-  }, [pdfUrl]);
+  }
 
   return (
-    <main className="flex h-screen w-full flex-col overflow-hidden bg-slate-50 font-sans text-slate-900 lg:flex-row">
+    <main className="min-h-screen bg-slate-50 text-slate-900">
       <input
-        ref={mainUploadInputRef}
+        ref={fileInputRef}
         type="file"
-        accept=".pdf,.docx,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
         className="hidden"
-        onChange={(e) => {
-          const f = e.target.files?.[0];
-          if (f) {
-            void handleUpload(f);
-          }
+        accept=".pdf,.docx,.pptx,.txt,.md,.html,.htm"
+        onChange={(event) => {
+          const file = event.target.files?.[0];
+          if (file) void handleUpload(file);
         }}
-        disabled={uploading}
       />
-      <section className="relative z-20 flex w-full flex-shrink-0 flex-col gap-5 border-r border-slate-200 bg-white p-6 shadow-[4px_0_24px_-12px_rgba(0,0,0,0.05)] lg:w-[420px] xl:w-[460px]">
-        <div className="flex items-center justify-between pb-2">
-          <h1 className="text-xl font-bold tracking-tight text-slate-900">
-            VisualRAG <span className="text-indigo-600">Insight</span>
-          </h1>
-          <div className="flex items-center gap-2">
-             <span className="relative flex h-2.5 w-2.5">
-              <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-75"></span>
-              <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-emerald-500"></span>
-            </span>
-            <span className="text-xs font-medium text-slate-500">Active</span>
-          </div>
-        </div>
 
-        <div className="group relative overflow-hidden rounded-2xl border border-slate-200 bg-slate-50/50 p-1 transition-all hover:border-indigo-200 hover:bg-slate-50 hover:shadow-md">
-           <div
-            className="flex flex-col items-center justify-center rounded-xl border border-dashed border-slate-300 bg-white py-8 text-center transition-colors group-hover:border-indigo-300"
-            onDragOver={(e) => {
-              e.preventDefault();
-            }}
-            onDrop={(e) => {
-              e.preventDefault();
-              const file = e.dataTransfer.files?.[0];
-              if (file && isAcceptedFile(file)) {
-                void handleUpload(file);
-              }
-            }}
-            onClick={() => {
-              if (uploading) return;
-              mainUploadInputRef.current?.click();
-            }}
+      <header className="border-b border-slate-200 bg-white">
+        <div className="mx-auto flex max-w-6xl items-center justify-between gap-4 px-5 py-5">
+          <div>
+            <h1 className="text-xl font-bold">VisualRAG 企业知识库</h1>
+            <p className="mt-1 text-sm text-slate-500">默认检索整个知识库，只在证据充分时回答。</p>
+          </div>
+          <button
+            type="button"
+            onClick={() => fileInputRef.current?.click()}
+            disabled={uploading}
+            className="rounded-xl bg-indigo-600 px-4 py-2.5 text-sm font-medium text-white disabled:opacity-50"
           >
-            <div className="mb-3 rounded-full bg-indigo-50 p-3 text-indigo-600">
-              <svg className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
-              </svg>
-            </div>
-            <button
-              type="button"
-              className="mb-1 text-sm font-semibold text-slate-900 hover:text-indigo-600"
-              onClick={(e) => {
-                e.stopPropagation();
-                if (uploading) return;
-                mainUploadInputRef.current?.click();
+            {uploading ? "导入中…" : "导入文档"}
+          </button>
+        </div>
+      </header>
+
+      <div className="mx-auto grid max-w-6xl gap-6 px-5 py-8 lg:grid-cols-[minmax(0,1fr)_280px]">
+        <section className="space-y-5">
+          <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+            <label htmlFor="knowledge-query" className="text-sm font-semibold">向整个知识库提问</label>
+            <textarea
+              id="knowledge-query"
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+              placeholder="例如：公司的差旅报销规则是什么？请给出引用依据。"
+              className="mt-3 min-h-32 w-full resize-y rounded-xl border border-slate-200 p-3 outline-none focus:border-indigo-500"
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) void handleAsk();
               }}
-            >
-              点击上传
-            </button>
-            <p className="text-xs text-slate-500">或将 PDF / Word 文件拖拽至此处</p>
+            />
+            <div className="mt-3 flex items-center justify-between gap-3">
+              <span className="text-xs text-slate-400">Ctrl / Cmd + Enter 发送</span>
+              <button
+                type="button"
+                onClick={() => void handleAsk()}
+                disabled={loading || !query.trim() || documents.length === 0}
+                className="rounded-xl bg-slate-900 px-5 py-2.5 text-sm font-medium text-white disabled:opacity-40"
+              >
+                {loading ? "检索与核验中…" : "查询知识库"}
+              </button>
+            </div>
           </div>
-          {uploadError && (
-            <div className="mt-2 rounded-xl border border-red-100 bg-red-50 px-3 py-2 text-xs text-red-600">
-              {uploadError}
+
+          {error ? <div className="rounded-xl bg-red-50 p-4 text-sm text-red-700">{error}</div> : null}
+          {result ? <KnowledgeBaseAnswer result={result} onOpenCitation={setCitation} /> : (
+            <div className="rounded-2xl border border-dashed border-slate-300 p-10 text-center text-sm text-slate-500">
+              回答会显示在这里；证据不足时系统会明确拒答。
             </div>
           )}
-        </div>
+        </section>
 
-        <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
-          <div className="mb-3 flex items-center justify-between">
-            <span className="text-sm font-semibold text-slate-900">处理队列</span>
-            <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-medium text-slate-500 font-mono">
-              {currentTaskId ? currentTaskId.slice(0, 8) : "IDLE"}
-            </span>
+        <aside className="h-fit rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+          <div className="flex items-center justify-between">
+            <h2 className="font-semibold">知识库文档</h2>
+            <span className="rounded-full bg-slate-100 px-2.5 py-1 text-xs text-slate-600">{documents.length}</span>
           </div>
-          {progress ? (
-            <div className="space-y-3">
-              <div className="flex items-center justify-between text-xs">
-                <span className="font-medium uppercase tracking-wider text-slate-500">
-                  {progress.stage.replace(/_/g, " ")}
-                </span>
-                <span className="font-bold text-indigo-600">
-                  {Math.round(progress.progress)}%
-                </span>
+          <div className="mt-4 space-y-2">
+            {documents.length === 0 ? <p className="text-sm text-slate-500">尚无已完成建库的文档。</p> : documents.map((document) => (
+              <div key={document.id} className="rounded-xl border border-slate-200 p-3">
+                <p className="truncate text-sm font-medium">{document.fileName}</p>
+                <p className="mt-1 text-xs uppercase text-slate-400">{document.fileType}</p>
               </div>
-              <div className="h-2 w-full overflow-hidden rounded-full bg-slate-100">
-                <div
-                  className="h-full rounded-full bg-indigo-600 shadow-[0_0_10px_rgba(79,70,229,0.3)] transition-all duration-500 ease-out"
-                  style={{ width: `${progress.progress}%` }}
-                />
-              </div>
-              {progress.message && (
-                <p className="text-xs text-slate-400">{progress.message}</p>
-              )}
-            </div>
-          ) : (
-            <div className="flex items-center justify-center py-2 text-xs text-slate-400">
-              Waiting for task...
-            </div>
-          )}
-        </div>
-
-        <div className="flex flex-col rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
-          <div className="mb-3 flex items-center justify-between">
-             <div className="text-sm font-semibold text-slate-900">
-              AI 助手
-            </div>
-             {chatError && (
-              <div className="rounded-full bg-red-50 px-2 py-0.5 text-[10px] text-red-600">
-                {chatError}
-              </div>
-            )}
+            ))}
           </div>
-          
-          <div className="overflow-hidden rounded-xl bg-slate-50/50 border border-slate-100 mb-4 relative">
-             {chatMessages.length === 0 ? (
-                <div className="absolute inset-0 flex flex-col items-center justify-center p-6 text-center text-slate-400">
-                  <svg className="mb-3 h-10 w-10 text-slate-300" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
-                  </svg>
-                  <p className="text-sm">Ready to chat about your document.</p>
-                </div>
-              ) : (
-                <div
-                  ref={chatListRef}
-                  className="h-64 w-full overflow-y-auto scrollbar-thin scrollbar-thumb-slate-200 px-4 py-2"
-                >
-                  {chatMessages.map((m) => {
-                    const isUser = m.role === "user";
-                    return (
-                      <div key={m.id} className="mb-2">
-                        <div className={`flex flex-col ${isUser ? "items-end" : "items-start"}`}>
-                          <div
-                            className={`mb-1 text-[10px] font-medium uppercase tracking-wider ${
-                              isUser ? "text-slate-400" : "text-indigo-500"
-                            }`}
-                          >
-                            {isUser ? "You" : "Assistant"}
-                          </div>
-                          <div
-                            className={`max-w-[90%] rounded-2xl px-4 py-3 text-sm shadow-sm ${
-                              isUser
-                                ? "bg-indigo-600 text-white rounded-tr-sm"
-                                : "bg-white border border-slate-100 text-slate-700 rounded-tl-sm"
-                            }`}
-                          >
-                            <div className="whitespace-pre-wrap leading-relaxed">
-                              {m.content}
-                            </div>
-                          </div>
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-          </div>
+        </aside>
+      </div>
 
-          <div className="flex gap-2">
-            <div className="relative flex-1">
-               <input
-                type="text"
-                value={chatInput}
-                onChange={(e) => setChatInput(e.target.value)}
-                placeholder="Ask something..."
-                className="w-full rounded-xl border border-slate-200 bg-slate-50 px-4 py-2.5 text-sm text-slate-900 placeholder:text-slate-400 focus:border-indigo-500 focus:bg-white focus:outline-none focus:ring-2 focus:ring-indigo-500/10 transition-all pr-10"
-              />
-               <button
-                  type="button"
-                  onClick={handleToggleVoiceInput}
-                  disabled={!speechSupported || chatStreaming}
-                  className={`absolute right-2 top-1/2 -translate-y-1/2 rounded-lg p-1.5 transition-colors ${
-                    recognizing 
-                    ? "bg-red-100 text-red-600 animate-pulse" 
-                    : "text-slate-400 hover:bg-slate-200 hover:text-slate-600"
-                  }`}
-                >
-                  <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" />
-                  </svg>
-                </button>
-            </div>
-           
-            <button
-              type="button"
-              onClick={handleChatSubmit}
-              disabled={chatStreaming || !chatInput.trim()}
-              className="inline-flex items-center justify-center rounded-xl bg-indigo-600 px-4 py-2 text-sm font-medium text-white shadow-sm shadow-indigo-200 transition-all hover:bg-indigo-700 hover:shadow-indigo-300 disabled:bg-slate-100 disabled:text-slate-400 disabled:shadow-none"
-            >
-               {chatStreaming ? (
-                  <span className="flex items-center gap-1">
-                     <span className="h-1.5 w-1.5 rounded-full bg-white animate-bounce"></span>
-                     <span className="h-1.5 w-1.5 rounded-full bg-white animate-bounce delay-75"></span>
-                     <span className="h-1.5 w-1.5 rounded-full bg-white animate-bounce delay-150"></span>
-                  </span>
-               ) : (
-                  <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" />
-                  </svg>
-               )}
-            </button>
-             <button
-              type="button"
-              onClick={handleResetChat}
-              disabled={chatMessages.length === 0 && !chatError}
-              className="inline-flex items-center justify-center rounded-xl border border-slate-200 bg-white px-3 py-2 text-slate-500 hover:bg-slate-50 hover:text-slate-700 transition-all disabled:opacity-50"
-            >
-               <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-                </svg>
-            </button>
-          </div>
-        </div>
-      </section>
-
-      <section className="relative flex flex-1 flex-col overflow-hidden bg-slate-50/50">
-        <div className="absolute inset-0 z-0 opacity-[0.03]" style={{ backgroundImage: 'radial-gradient(#6366f1 1px, transparent 1px)', backgroundSize: '24px 24px' }}></div>
-        <div className="relative z-10 flex h-full flex-col p-4 lg:p-8">
-           <div className="h-full w-full overflow-hidden rounded-3xl border border-slate-200 bg-white shadow-[0_8px_40px_-12px_rgba(0,0,0,0.1)] ring-1 ring-slate-900/5">
-             {!viewerDocumentId ? (
-               <div
-                 className="flex h-full w-full cursor-pointer flex-col items-center justify-center gap-3 border-2 border-dashed border-slate-200 bg-slate-50/70 px-8 text-center transition-colors hover:border-indigo-300 hover:bg-indigo-50/40"
-                 onDragOver={(e) => {
-                   e.preventDefault();
-                 }}
-                 onDrop={(e) => {
-                   e.preventDefault();
-                   if (uploading) return;
-                   const file = e.dataTransfer.files?.[0];
-                   if (file && isAcceptedFile(file)) {
-                     void handleUpload(file);
-                   }
-                 }}
-                 onClick={() => {
-                   if (uploading) return;
-                   mainUploadInputRef.current?.click();
-                 }}
-               >
-                 <div className="mb-2 rounded-full bg-indigo-50 p-4 text-indigo-600">
-                   <svg className="h-7 w-7" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
-                   </svg>
-                 </div>
-                 <div className="text-sm font-semibold text-slate-900">
-                   点击或拖拽文档到此区域上传
-                 </div>
-                 <div className="text-xs text-slate-500">
-                   支持 PDF 和 Word (.docx) 文档，处理中可在左侧查看进度
-                 </div>
-               </div>
-             ) : documentType === "docx" && docxHtml ? (
-               <DocxViewer
-                 documentId={viewerDocumentId}
-                 html={docxHtml}
-               />
-             ) : documentType === "docx" && docxHtmlError ? (
-               <div className="flex h-full w-full flex-col items-center justify-center gap-3 text-sm text-slate-500">
-                 <p>文档内容加载失败</p>
-                 <button
-                   type="button"
-                   className="rounded-xl bg-indigo-600 px-4 py-2 text-sm font-medium text-white shadow-sm transition hover:bg-indigo-700"
-                   onClick={() => {
-                     setDocxHtmlError(false);
-                     loadDocxHtml(viewerDocumentId!).then((html) => {
-                       if (html) {
-                         setDocxHtml(html);
-                       } else {
-                         setDocxHtmlError(true);
-                       }
-                     });
-                   }}
-                 >
-                   重新加载
-                 </button>
-               </div>
-             ) : documentType === "docx" ? (
-               <div className="flex h-full w-full items-center justify-center text-sm text-slate-400">
-                 正在加载文档内容...
-               </div>
-             ) : (
-               <PdfViewer
-                 documentId={viewerDocumentId ?? "demo-doc"}
-                 pages={pages}
-                 regionsByPage={regionsByPage}
-                 renderPage={renderPdfPage}
-               />
-             )}
-           </div>
-        </div>
-      </section>
+      <CitationPreviewPanel citation={citation} onClose={() => setCitation(null)} />
     </main>
   );
 }

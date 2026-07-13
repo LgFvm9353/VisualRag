@@ -16,15 +16,19 @@ import { config } from "../../../config/env.js";
 import { logger } from "../../../lib/logger.js";
 import type { RerankerService } from "./reranker.service.js";
 import { postProcess, type SearchResult } from "./post-processor.js";
+import type { KnowledgeBaseFileType } from "./query-metadata.js";
 
 export interface HybridSearchParams {
-  documentIds: string[];
+  documentIds?: string[];
   query: string;
   topK?: number;
   /** 可选的页面范围过滤 */
   pageRange?: [number, number];
   /** 是否跳过 rerank（用于快速搜索） */
   skipRerank?: boolean;
+  publishedYear?: number | null;
+  fileTypes?: KnowledgeBaseFileType[];
+  tags?: string[];
 }
 
 export class HybridSearchService {
@@ -40,11 +44,37 @@ export class HybridSearchService {
     });
   }
 
+  private async resolveDocumentIds(params: HybridSearchParams): Promise<string[]> {
+    if (params.documentIds?.length) return params.documentIds;
+
+    const documents = await this.prisma.document.findMany({
+      where: {
+        status: "ready",
+        ...(params.fileTypes?.length ? { fileType: { in: params.fileTypes } } : {}),
+        ...(params.tags?.length ? { tags: { hasEvery: params.tags } } : {}),
+        ...(params.publishedYear
+          ? {
+              publishedAt: {
+                gte: new Date(`${params.publishedYear}-01-01T00:00:00.000Z`),
+                lt: new Date(`${params.publishedYear + 1}-01-01T00:00:00.000Z`),
+              },
+            }
+          : {}),
+      },
+      select: { id: true },
+    });
+
+    return documents.map((document) => document.id);
+  }
+
   /**
    * 混合检索主入口。
    */
   async search(params: HybridSearchParams): Promise<SearchResult[]> {
-    const { documentIds, query, topK = 10, pageRange, skipRerank = false } = params;
+    const documentIds = await this.resolveDocumentIds(params);
+    if (documentIds.length === 0) return [];
+
+    const { query, topK = 10, pageRange, skipRerank = false } = params;
     const fetchK = topK * 3; // 多取一些给 rerank 用
 
     // Step 1: 并行 Dense + BM25
@@ -66,8 +96,8 @@ export class HybridSearchService {
 
     // Step 4: Rerank
     let reranked: SearchResult[];
-    if (!skipRerank && this.reranker && withContext.length > topK) {
-      reranked = await this.reranker.rerank(query, withContext, topK * 2);
+    if (!skipRerank && this.reranker && withContext.length > 0) {
+      reranked = await this.reranker.rerank(query, withContext, Math.min(topK * 2, withContext.length));
     } else {
       reranked = withContext.slice(0, topK * 2);
     }
@@ -77,6 +107,20 @@ export class HybridSearchService {
       threshold: 0.3,
       deduplicate: true,
     });
+
+    if (final.length === 0 && reranked.length > 0) {
+      logger.warn(
+        {
+          documentIds,
+          query: query.slice(0, 80),
+          rerankedCount: reranked.length,
+        },
+        "[hybridSearch] 阈值过滤后结果为空，回退到无阈值后处理",
+      );
+      return postProcess(reranked, {
+        deduplicate: true,
+      }).slice(0, topK);
+    }
 
     return final.slice(0, topK);
   }

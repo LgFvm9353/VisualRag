@@ -7,6 +7,7 @@ import type {
   IngestionStage,
   IngestionProgressEvent,
   LayoutPage,
+  ExtractedDocumentMetadata,
 } from "./types.js";
 import { ProgressEmitter } from "./progressEmitter.js";
 import { extractTextFromPdf } from "../pdf/textExtractor.js";
@@ -17,11 +18,27 @@ import {
   toTextPages,
   type DocxParagraph,
 } from "../docx/textExtractor.js";
+import { extractTextPagesFromHtml, extractTextPagesFromPlainText } from "../text/textExtractor.js";
+import { extractTextPagesFromPptx } from "../pptx/textExtractor.js";
+import { ChunkingService, type ChunkRecord } from "../modules/search/chunking/chunking.service.js";
 
 type StageHandler = (task: IngestionTask) => Promise<void>;
 
 function sanitizePostgresText(text: string) {
   return text.replace(/\u0000/g, "");
+}
+
+function buildExtractedDocumentMetadata(
+  fileName: string,
+  fileType: IngestionTask["fileType"],
+): ExtractedDocumentMetadata | null {
+  if (fileType === "image" || fileType === "zip") return null;
+  return {
+    sourceLabel: fileName,
+    publishedAt: null,
+    tags: [],
+    fileType,
+  };
 }
 
 export class IngestionPipeline {
@@ -46,7 +63,7 @@ export class IngestionPipeline {
 
   createTask(params: {
     fileName: string;
-    fileType: "pdf" | "docx" | "image" | "zip";
+    fileType: "pdf" | "docx" | "text" | "html" | "pptx" | "image" | "zip";
     sourcePath: string;
   }): IngestionTask {
     const now = new Date();
@@ -85,7 +102,17 @@ export class IngestionPipeline {
     const now = new Date();
     const detectedFileType =
       params.fileType ??
-      (params.sourcePath?.toLowerCase().endsWith(".docx") ? "docx" : "pdf");
+      (params.sourcePath?.toLowerCase().endsWith(".docx")
+        ? "docx"
+        : params.sourcePath?.toLowerCase().endsWith(".txt") ||
+            params.sourcePath?.toLowerCase().endsWith(".md")
+          ? "text"
+          : params.sourcePath?.toLowerCase().endsWith(".html") ||
+              params.sourcePath?.toLowerCase().endsWith(".htm")
+            ? "html"
+            : params.sourcePath?.toLowerCase().endsWith(".pptx")
+              ? "pptx"
+              : "pdf");
     const task: IngestionTask = {
       id: params.documentId,
       fileName: params.fileName,
@@ -150,17 +177,15 @@ export class IngestionPipeline {
   private static readonly TASK_TIMEOUT = 15 * 60 * 1000; // 15 分钟
 
   private async runTask(task: IngestionTask) {
-    const isDocx = task.fileType === "docx";
+    const isPdf = task.fileType === "pdf";
 
-    // PDF 流程：extract → layout → text-embeddings → write-db
-    // Word 流程：extract → text-embeddings → write-db（无 layout/image-embeddings）
     const stages: { stage: IngestionStage; handler: StageHandler }[] = [
       { stage: "extracting_text", handler: this.extractText },
-      ...(!isDocx
+      ...(isPdf
         ? [{ stage: "layout_analysis" as IngestionStage, handler: this.layoutAnalysis }]
         : []),
       { stage: "generating_text_embeddings", handler: this.generateTextEmbeddings },
-      ...(!isDocx
+      ...(isPdf
         ? [{ stage: "generating_image_embeddings" as IngestionStage, handler: this.generateImageEmbeddings }]
         : []),
       { stage: "writing_database", handler: this.writeDatabase },
@@ -192,10 +217,10 @@ export class IngestionPipeline {
       }
       // 持久化 layout / HTML 到磁盘（服务重启 / dedup 时需要）
       // 注意：Word HTML 已在 extractText 中提前持久化，此处为兜底
-      if (isDocx) {
-        await this.persistDocxHtml(task);
-      } else {
+      if (isPdf) {
         await this.persistLayout(task);
+      } else if (task.fileType === "docx") {
+        await this.persistDocxHtml(task);
       }
       this.updateTaskStage(task, "completed", 100);
     } catch (err) {
@@ -221,10 +246,27 @@ export class IngestionPipeline {
         docxParagraphs: result.paragraphs,
         docxHtml: result.html,
       };
-      // 提前持久化 HTML，确保即使后续阶段失败也能恢复
       this.persistDocxHtml(task).catch((err) =>
         console.error("extractText persistDocxHtml failed:", err),
       );
+    } else if (task.fileType === "text") {
+      const result = await extractTextPagesFromPlainText(task.sourcePath);
+      task.meta = {
+        ...(task.meta || {}),
+        textPages: result.pages,
+      };
+    } else if (task.fileType === "html") {
+      const result = await extractTextPagesFromHtml(task.sourcePath);
+      task.meta = {
+        ...(task.meta || {}),
+        textPages: result.pages,
+      };
+    } else if (task.fileType === "pptx") {
+      const result = await extractTextPagesFromPptx(task.sourcePath);
+      task.meta = {
+        ...(task.meta || {}),
+        textPages: result.pages,
+      };
     } else {
       const result = await extractTextFromPdf(task.sourcePath);
       task.meta = {
@@ -260,48 +302,10 @@ export class IngestionPipeline {
     if (!textPages || textPages.length === 0) {
       return;
     }
-    if (!process.env.OPENAI_API_KEY) {
-      return;
-    }
-    try {
-      const embeddings: {
-        pageNumber: number;
-        text: string;
-        embedding: number[];
-      }[] = [];
-      const total = textPages.length;
-      for (let index = 0; index < textPages.length; index++) {
-        const page = textPages[index];
-        const cleanedText = sanitizePostgresText(page.text);
-        const input =
-          cleanedText.length > 8000 ? cleanedText.slice(0, 8000) : cleanedText;
-        const response = await this.openai.embeddings.create({
-          model: this.embeddingModel,
-          input,
-        });
-        const vector = response.data[0]?.embedding ?? [];
-        embeddings.push({
-          pageNumber: page.pageNumber,
-          text: cleanedText,
-          embedding: vector,
-        });
-        const baseProgress = this.stageBaseProgress("generating_text_embeddings", task);
-        const stageSpan = (task.meta as any)?._stageSpan ?? 15;
-        const progress = baseProgress + ((index + 1) / total) * stageSpan;
-        task.progress = progress;
-        this.progressEmitter.emit(task.id, {
-          stage: "generating_text_embeddings",
-          progress,
-        } as IngestionProgressEvent);
-      }
-      task.meta = {
-        ...(task.meta || {}),
-        textEmbeddings: embeddings,
-      };
-      this.tasks.set(task.id, task);
-    } catch (err) {
-      console.error("generateTextEmbeddings failed", err);
-    }
+
+    // 文本 embedding 已切换为基于 chunk 的主链生成，
+    // 此阶段仅保留进度占位，避免继续对整页/整段做重复 embedding。
+    await this.simulateWork(task, "generating_text_embeddings");
   }
 
   private async generateImageEmbeddings(task: IngestionTask) {
@@ -397,37 +401,44 @@ export class IngestionPipeline {
       | { pageNumber: number; width: number; height: number; text: string }[]
       | undefined;
     const layoutPages = (task.meta as any)?.layoutPages as LayoutPage[] | undefined;
-    const textEmbeddings = (task.meta as any)?.textEmbeddings as
-      | {
-          pageNumber: number;
-          text: string;
-          embedding: number[];
-        }[]
-      | undefined;
 
     if (!textPages || textPages.length === 0) {
       return;
     }
 
     const isDocx = task.fileType === "docx";
+    const isSectionBasedText =
+      task.fileType === "text" || task.fileType === "html" || task.fileType === "pptx";
     const docxParagraphs = (task.meta as any)?.docxParagraphs as
       | DocxParagraph[]
       | undefined;
 
     // 1. 创建 Document 记录
+    const metadata = buildExtractedDocumentMetadata(task.fileName, task.fileType);
     await prisma.document.create({
       data: {
         id: task.id,
         fileName: task.fileName,
-        fileType: isDocx ? "docx" : "pdf",
+        fileType: task.fileType,
         status: "processing",
+        sourceLabel: metadata?.sourceLabel ?? task.fileName,
+        publishedAt: metadata?.publishedAt ? new Date(metadata.publishedAt) : null,
+        tags: metadata?.tags ?? [],
+        metadataJson: metadata ?? undefined,
       },
     });
 
-    // 2. 为每页/每段落创建 DocumentSection + Chunk + ChunkEmbedding
+    // 2. 创建 DocumentSection
     // 跳过内容过短的段落（如表格中的单个数字），避免产生无意义的检索结果
     const MIN_CONTENT_LENGTH = 20;
+    const createdSections: {
+      id: string;
+      pageNumber?: number | null;
+      content: string;
+      title?: string | null;
+    }[] = [];
     let skippedShortCount = 0;
+
     for (let i = 0; i < textPages.length; i++) {
       const page = textPages[i];
       const cleanedText = sanitizePostgresText(page.text);
@@ -439,23 +450,21 @@ export class IngestionPipeline {
       const layout = layoutPages?.find((p) => p.pageNumber === page.pageNumber);
       const docxPara = docxParagraphs?.[i];
 
-      // 创建 DocumentSection —— PDF 与 Word 字段不同
       const sectionData: Record<string, unknown> = {
         documentId: task.id,
         index: page.pageNumber,
         content: cleanedText,
-        sourceType: isDocx ? "docx" : "pdf",
+        sourceType: task.fileType,
       };
 
-      if (isDocx) {
-        // Word 文档：使用 headingLevel/parentId，PDF 字段为 null
+      if (isDocx || isSectionBasedText) {
         sectionData.pageNumber = null;
         sectionData.pageWidth = null;
         sectionData.pageHeight = null;
         sectionData.headingLevel = docxPara?.headingLevel ?? null;
         sectionData.parentId = docxPara?.parentIndex?.toString() ?? null;
+        sectionData.title = docxPara?.headingLevel ? cleanedText.slice(0, 120) : null;
       } else {
-        // PDF 文档：使用 pageNumber/pageWidth/pageHeight
         sectionData.pageNumber = page.pageNumber;
         sectionData.pageWidth = layout?.width ?? page.width;
         sectionData.pageHeight = layout?.height ?? page.height;
@@ -465,36 +474,69 @@ export class IngestionPipeline {
         data: sectionData,
       });
 
-      // 为整页/整段创建一个 Chunk（后续可由 ChunkingService 细粒度分块）
-      const chunk = await prisma.chunk.create({
-        data: {
-          documentId: task.id,
-          sectionId: section.id,
-          chunkIndex: 0,
-          content: cleanedText,
-          startOffset: 0,
-          endOffset: cleanedText.length,
-        },
+      createdSections.push({
+        id: section.id,
+        pageNumber: section.pageNumber,
+        content: cleanedText,
+        title: section.title ?? null,
       });
+    }
 
-      // 创建 ChunkEmbedding
-      const embeddingEntry = textEmbeddings?.find(
-        (e) => e.pageNumber === page.pageNumber,
-      );
-      if (embeddingEntry && embeddingEntry.embedding.length > 0) {
-        const embeddingLiteral = `[${embeddingEntry.embedding.join(",")}]`;
+    if (createdSections.length === 0) {
+      await prisma.document.update({
+        where: { id: task.id },
+        data: { status: "failed" },
+      });
+      throw new Error(`document_has_no_valid_sections: skippedShortCount=${skippedShortCount}`);
+    }
+
+    // 3. 使用 ChunkingService 接入主链分块，而不是继续按整页/整段建一个粗粒度 chunk
+    const chunkingService = new ChunkingService(prisma);
+    const { chunks } = await chunkingService.chunkDocument(task.id, createdSections, {
+      skipContextualRetrieval: createdSections.length > 40,
+    });
+
+    // 4. 为真实 chunk 生成向量，建立检索主链
+    await this.createChunkEmbeddings(task, chunks);
+
+    // 5. 标记处理完成
+    await prisma.document.update({
+      where: { id: task.id },
+      data: { status: "ready" },
+    });
+  }
+
+  private async createChunkEmbeddings(task: IngestionTask, chunks: ChunkRecord[]) {
+    if (!process.env.OPENAI_API_KEY || chunks.length === 0) {
+      return;
+    }
+
+    const total = chunks.length;
+    for (let index = 0; index < chunks.length; index++) {
+      const chunk = chunks[index];
+      const input = chunk.content.length > 8000 ? chunk.content.slice(0, 8000) : chunk.content;
+      const response = await this.openai.embeddings.create({
+        model: this.embeddingModel,
+        input,
+      });
+      const embedding = response.data[0]?.embedding ?? [];
+      if (embedding.length > 0) {
+        const embeddingLiteral = `[${embedding.join(",")}]`;
         await prisma.$executeRaw`
           INSERT INTO "ChunkEmbedding" ("id", "chunkId", "documentId", "embedding")
           VALUES (${randomUUID()}, ${chunk.id}, ${task.id}, ${embeddingLiteral}::vector)
         `;
       }
-    }
 
-    // 标记处理完成
-    await prisma.document.update({
-      where: { id: task.id },
-      data: { status: "ready" },
-    });
+      const baseProgress = this.stageBaseProgress("writing_database", task);
+      const stageSpan = (task.meta as any)?._stageSpan ?? 15;
+      const progress = baseProgress + ((index + 1) / total) * stageSpan;
+      task.progress = progress;
+      this.progressEmitter.emit(task.id, {
+        stage: "writing_database",
+        progress,
+      } as IngestionProgressEvent);
+    }
   }
 
   /** 持久化 layout 数据到 PDF 旁（服务重启 / dedup 上传时需要） */

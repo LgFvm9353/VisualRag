@@ -1,3 +1,10 @@
+export type ExtractedDocumentMetadata = {
+  sourceLabel: string | null;
+  publishedAt: string | null;
+  tags: string[];
+  fileType: "pdf" | "docx" | "pptx" | "text" | "html";
+};
+
 export type IngestionStage =
   | "queued"
   | "extracting_text"
@@ -11,7 +18,7 @@ export type IngestionStage =
 export interface IngestionTask {
   id: string;
   fileName: string;
-  fileType: "pdf" | "docx" | "image" | "zip";
+  fileType: "pdf" | "docx" | "text" | "html" | "pptx" | "image" | "zip";
   sourcePath: string;
   createdAt: Date;
   updatedAt: Date;
