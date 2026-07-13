@@ -6,3 +6,7 @@ docs/
 
 # Temporary PPTX verification artifacts
 **/.tmp-pptx-check/
+
+# Local test artifacts
+frontend/src/components/__tests__/
+backend/src/modules/search/retrieval/__tests__/

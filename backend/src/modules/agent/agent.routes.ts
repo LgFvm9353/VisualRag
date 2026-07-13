@@ -1,5 +1,6 @@
 import type { FastifyPluginAsync } from "fastify";
 import type { PrismaClient } from "@prisma/client";
+import OpenAI from "openai";
 import { z } from "zod";
 import type { IngestionPipeline } from "../../pipeline/ingestionPipeline.js";
 import { AgentRuntime } from "./runtime.js";
@@ -10,6 +11,18 @@ import {
 } from "./types.js";
 import { logAgentRunStart } from "./trace.js";
 import { askKnowledgeBaseSchema } from "../knowledge-base/knowledge-base.types.js";
+import { config } from "../../config/env.js";
+import { OpenAICompatibleChatGateway } from "./model/chat-model.gateway.js";
+import { IntentRouter } from "./intent/intent-router.js";
+import { ConversationQueryResolver } from "./conversation/conversation-query-resolver.js";
+import { RetrievalRetryPlanner } from "./retrieval/retry-planner.js";
+import { KnowledgeBaseSearchTool } from "./tools/knowledge-base-search.tool.js";
+import { HybridSearchService } from "../search/retrieval/hybrid-search.service.js";
+import { LLMReranker } from "../search/retrieval/reranker.service.js";
+import { GroundedAnswerGenerator } from "./answer/grounded-answer.generator.js";
+import { KnowledgeBaseAgentGraph } from "./graph/knowledge-base-agent.graph.js";
+import { KnowledgeBaseAgentService } from "./knowledge-base-agent.service.js";
+import { SseWriter } from "./stream/sse-writer.js";
 
 interface AgentRoutesOptions {
   prisma: PrismaClient;
@@ -20,6 +33,20 @@ const sessionParamsSchema = z.object({ id: z.string().uuid() });
 
 export const agentRoutes: FastifyPluginAsync<AgentRoutesOptions> = async (app, opts) => {
   const runtime = new AgentRuntime({ prisma: opts.prisma, pipeline: opts.pipeline });
+  const chatGateway = new OpenAICompatibleChatGateway(new OpenAI({
+    baseURL: config.chat.baseURL,
+    apiKey: config.chat.apiKey,
+  }), config.chat.model);
+  const knowledgeBaseAgent = new KnowledgeBaseAgentService(
+    opts.prisma,
+    new KnowledgeBaseAgentGraph({
+      intentRouter: new IntentRouter(chatGateway),
+      queryResolver: new ConversationQueryResolver(chatGateway),
+      searchTool: new KnowledgeBaseSearchTool(new HybridSearchService(opts.prisma, new LLMReranker())),
+      retryPlanner: new RetrievalRetryPlanner(chatGateway),
+      answerGenerator: new GroundedAnswerGenerator(chatGateway),
+    }),
+  );
 
   app.post("/knowledge-base/ask", async (request, reply) => {
     const input = askKnowledgeBaseSchema.parse(request.body ?? {});
@@ -94,8 +121,26 @@ export const agentRoutes: FastifyPluginAsync<AgentRoutesOptions> = async (app, o
       startedAt: new Date().toISOString(),
     };
     logAgentRunStart(trace, input);
-    const result = await runtime.appendMessage(params.id, input, trace);
+    const result = await knowledgeBaseAgent.sendMessage(params.id, input, { traceId: trace.traceId });
     reply.code(201).send(result);
+  });
+
+  app.post("/agent/sessions/:id/messages/stream", async (request, reply) => {
+    const params = sessionParamsSchema.parse(request.params);
+    const input = createAgentMessageSchema.pick({ content: true }).parse(request.body);
+    const traceId = String(request.id);
+    const stream = new SseWriter(reply, { sessionId: params.id, traceId });
+    stream.open();
+    try {
+      await knowledgeBaseAgent.sendMessage(params.id, input, {
+        traceId,
+        onEvent: async (event) => stream.write(event),
+      });
+    } catch (error) {
+      app.log.error({ err: error, traceId }, "knowledge_base_agent_stream_failed");
+    } finally {
+      stream.close();
+    }
   });
 
   app.post("/agent/tasks", async (request, reply) => {

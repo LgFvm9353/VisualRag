@@ -125,17 +125,26 @@ model ChatSession {
 }
 
 model ChatMessage {
-  id         String      @id @default(uuid())
-  session    ChatSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
-  sessionId  String
-  role       String      // "user" | "assistant" | "system"
-  content    String
-  audioUrl      String?          // 语音输入音频文件 URL（如用 S3/本地存储）
+  id            String      @id @default(uuid())
+  session       ChatSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  sessionId     String
+  role          String      // "user" | "assistant" | "system"
+  content       String
+  status        String      @default("completed") // "processing" | "completed" | "failed"
+  intent        String?
+  resolvedQuery String?
+  traceId       String?
+  errorCode     String?
+  startedAt     DateTime?
+  completedAt   DateTime?
+  metadataJson  Json?
+  audioUrl      String?     // 语音输入音频文件 URL（如用 S3/本地存储）
   citations     Json?
-  createdAt     DateTime         @default(now())
+  createdAt     DateTime    @default(now())
   chatReferences ChatReference[]
 
   @@index([sessionId])
+  @@index([sessionId, status])
 }
 
 // ============================================================
