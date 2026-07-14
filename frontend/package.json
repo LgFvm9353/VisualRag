@@ -10,16 +10,10 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "class-variance-authority": "^0.7.0",
-    "framer-motion": "^11.0.0",
-    "js-sha256": "^0.11.1",
-    "lucide-react": "^0.460.0",
     "next": "14.2.10",
     "pdfjs-dist": "^4.7.76",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
-    "react-window": "^1.8.10",
-    "socket.io-client": "^4.8.1",
     "tailwindcss-animate": "^1.0.7",
     "zustand": "^5.0.0"
   },
@@ -30,7 +24,6 @@
     "@types/node": "^22.10.2",
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.2",
-    "@types/react-window": "^1.8.8",
     "@vitejs/plugin-react": "^6.0.3",
     "autoprefixer": "^10.4.20",
     "eslint": "^8.57.1",

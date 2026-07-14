@@ -4,7 +4,7 @@
  * 架构: Fastify 插件模式
  *   server/
  *     app.ts          Fastify 应用工厂 + Socket.IO
- *     plugins/        cors / auth / rate-limit
+ *     plugins/        cors / auth
  *   modules/
  *     upload/         文件上传（分片 + 断点续传）
  *     document/       文档查询
