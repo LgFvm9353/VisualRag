@@ -8,6 +8,49 @@ export class KnowledgeBaseAgentService {
     private readonly graph: Pick<KnowledgeBaseAgentGraph, "invoke">,
   ) {}
 
+  async createSession(input: { documentId?: string; title?: string | null }) {
+    const session = await this.prisma.chatSession.create({
+      data: {
+        documentId: input.documentId ?? null,
+        title: input.title ?? null,
+      },
+    });
+
+    return this.toSessionDto(session);
+  }
+
+  async getSession(sessionId: string) {
+    const session = await this.prisma.chatSession.findUnique({
+      where: { id: sessionId },
+    });
+
+    return session ? this.toSessionDto(session) : null;
+  }
+
+  async listSessionMessages(sessionId: string) {
+    const messages = await this.prisma.chatMessage.findMany({
+      where: { sessionId },
+      orderBy: { createdAt: "asc" },
+    });
+
+    return messages.map((message) => ({
+      id: message.id,
+      sessionId: message.sessionId,
+      role: message.role,
+      content: message.content,
+      status: message.status,
+      traceId: message.traceId,
+      intent: message.intent,
+      resolvedQuery: message.resolvedQuery,
+      citations: message.citations,
+      metadata: message.metadataJson,
+      errorCode: message.errorCode,
+      startedAt: message.startedAt?.toISOString() ?? null,
+      completedAt: message.completedAt?.toISOString() ?? null,
+      createdAt: message.createdAt.toISOString(),
+    }));
+  }
+
   async sendMessage(
     sessionId: string,
     input: { content: string },
@@ -89,5 +132,21 @@ export class KnowledgeBaseAgentService {
       await options.onEvent?.({ type: "message.failed", data: { code, retryable: false, message: "Agent 执行失败" } });
       throw error;
     }
+  }
+
+  private toSessionDto(session: {
+    id: string;
+    documentId: string | null;
+    title: string | null;
+    createdAt: Date;
+    updatedAt: Date;
+  }) {
+    return {
+      id: session.id,
+      documentId: session.documentId,
+      title: session.title,
+      createdAt: session.createdAt.toISOString(),
+      updatedAt: session.updatedAt.toISOString(),
+    };
   }
 }

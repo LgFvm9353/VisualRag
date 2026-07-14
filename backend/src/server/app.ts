@@ -80,7 +80,7 @@ export async function buildApp() {
   // ---- Routes ----
   app.register(uploadRoutes, { pipeline, prisma });
   app.register(documentRoutes, { pipeline, prisma });
-  app.register(agentRoutes, { prisma, pipeline });
+  app.register(agentRoutes, { prisma });
 
   // ---- Health ----
   app.get("/health", async (_request, reply) => {

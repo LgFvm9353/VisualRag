@@ -10,3 +10,4 @@ coverage
 .turbo
 *.log
 *.tmp
+*.tsbuildinfo

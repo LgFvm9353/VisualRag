@@ -1,4 +1,3 @@
-export type KnowledgeBaseDecision = "answer" | "refuse" | "narrow";
 export type KnowledgeBaseSourceType = "pdf" | "docx" | "pptx" | "text" | "html";
 
 export interface KnowledgeBaseCitation {
@@ -8,19 +7,6 @@ export interface KnowledgeBaseCitation {
   chunkId?: string;
   snippet: string;
   sourceType: KnowledgeBaseSourceType;
-}
-
-export interface AskKnowledgeBaseResponse {
-  answer: string;
-  decision: KnowledgeBaseDecision;
-  citations: KnowledgeBaseCitation[];
-  retrieval: {
-    hitCount: number;
-    cragAction: "accept" | "refine" | "reject";
-    refinedQuery: string | null;
-    usedReranker: string;
-  };
-  trace: { traceId: string; durationMs: number; startedAt: string };
 }
 
 export interface KnowledgeBaseDocument {
@@ -42,19 +28,6 @@ async function readError(response: Response): Promise<string> {
   } catch {
     return `request_failed_${response.status}`;
   }
-}
-
-export async function askKnowledgeBase(input: {
-  query: string;
-  history?: Array<{ role: "user" | "assistant"; content: string }>;
-}): Promise<AskKnowledgeBaseResponse> {
-  const response = await fetch(`${backendUrl}/knowledge-base/ask`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(input),
-  });
-  if (!response.ok) throw new Error(await readError(response));
-  return response.json();
 }
 
 export async function listKnowledgeBaseDocuments(): Promise<KnowledgeBaseDocument[]> {
