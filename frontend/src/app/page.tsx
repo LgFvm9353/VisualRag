@@ -8,7 +8,12 @@ import {
 } from "@/components/KnowledgeBaseChat";
 import { KnowledgeBaseDocumentList } from "@/components/KnowledgeBaseDocumentList";
 import {
+  KnowledgeBaseUploadStatus,
+  type UploadStatus,
+} from "@/components/KnowledgeBaseUploadStatus";
+import {
   createAgentSession,
+  getIngestionTask,
   listKnowledgeBaseDocuments,
   streamAgentMessage,
   uploadKnowledgeBaseDocument,
@@ -24,8 +29,10 @@ export default function HomePage() {
   const [citation, setCitation] = useState<KnowledgeBaseCitation | null>(null);
   const [loading, setLoading] = useState(false);
   const [uploading, setUploading] = useState(false);
+  const [uploadStatus, setUploadStatus] = useState<UploadStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const uploadAbortRef = useRef<AbortController | null>(null);
 
   const refreshDocuments = useCallback(async () => {
     try {
@@ -40,6 +47,10 @@ export default function HomePage() {
   useEffect(() => {
     void refreshDocuments();
   }, [refreshDocuments]);
+
+  useEffect(() => {
+    return () => uploadAbortRef.current?.abort();
+  }, []);
 
   async function ensureSession(): Promise<string> {
     if (sessionId) return sessionId;
@@ -132,21 +143,107 @@ export default function HomePage() {
   }
 
   async function handleUpload(file: File) {
+    uploadAbortRef.current?.abort();
+    const controller = new AbortController();
+    uploadAbortRef.current = controller;
     setUploading(true);
     setError(null);
+    setUploadStatus({
+      fileName: file.name,
+      state: "hashing",
+      progress: 0,
+      message: "正在计算文件指纹…",
+    });
+
     try {
-      await uploadKnowledgeBaseDocument(file);
-      await refreshDocuments();
+      const result = await uploadKnowledgeBaseDocument(file, {
+        signal: controller.signal,
+        onProgress: ({ phase, progress }) => {
+          setUploadStatus({
+            fileName: file.name,
+            state: phase,
+            progress,
+            message:
+              phase === "hashing" ? "正在计算文件指纹…" : "正在上传文件…",
+          });
+        },
+      });
+
+      if (result.deduplicated) {
+        setUploadStatus({
+          fileName: file.name,
+          state: "completed",
+          progress: 100,
+          message: "文档已存在",
+          taskId: result.taskId,
+          deduplicated: true,
+        });
+        await refreshDocuments();
+        return;
+      }
+
+      const deadline = Date.now() + 10 * 60 * 1000;
+      while (Date.now() < deadline) {
+        const task = await getIngestionTask(result.taskId, controller.signal);
+        if (task.stage === "failed") {
+          throw new Error(task.error || "文档处理失败");
+        }
+        if (task.stage === "completed") {
+          setUploadStatus({
+            fileName: file.name,
+            state: "completed",
+            progress: 100,
+            message: "文档处理完成",
+            taskId: task.id,
+            stage: task.stage,
+          });
+          await refreshDocuments();
+          return;
+        }
+
+        setUploadStatus({
+          fileName: file.name,
+          state: "processing",
+          progress: task.progress,
+          message: "正在处理文档…",
+          taskId: task.id,
+          stage: task.stage,
+        });
+        await new Promise<void>((resolve, reject) => {
+          const timeout = window.setTimeout(resolve, 1500);
+          controller.signal.addEventListener(
+            "abort",
+            () => {
+              window.clearTimeout(timeout);
+              reject(new DOMException("Aborted", "AbortError"));
+            },
+            { once: true },
+          );
+        });
+      }
+      throw new Error("文档处理超时，请稍后刷新文档列表确认结果");
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "upload_failed");
+      if (cause instanceof DOMException && cause.name === "AbortError") return;
+      const message = cause instanceof Error ? cause.message : "upload_failed";
+      setUploadStatus({
+        fileName: file.name,
+        state: "failed",
+        progress: 0,
+        message: "文档上传或处理失败",
+        error: message,
+      });
+      setError(message);
     } finally {
-      setUploading(false);
-      if (fileInputRef.current) fileInputRef.current.value = "";
+      if (uploadAbortRef.current === controller) {
+        uploadAbortRef.current = null;
+        setUploading(false);
+        if (fileInputRef.current) fileInputRef.current.value = "";
+      }
     }
   }
 
   return (
-    <main className="min-h-screen bg-slate-50 text-slate-900">
+    <main className="flex h-full min-h-0 flex-col overflow-hidden bg-slate-50 text-slate-900">
       <input
         ref={fileInputRef}
         type="file"
@@ -157,7 +254,7 @@ export default function HomePage() {
           if (file) void handleUpload(file);
         }}
       />
-      <header className="border-b border-slate-200 bg-white">
+      <header className="shrink-0 border-b border-slate-200 bg-white">
         <div className="mx-auto flex max-w-6xl items-center justify-between px-5 py-5">
           <div>
             <h1 className="text-xl font-bold">VisualRAG 知识库 Agent</h1>
@@ -175,9 +272,10 @@ export default function HomePage() {
           </button>
         </div>
       </header>
-      <div className="mx-auto grid max-w-6xl gap-6 px-5 py-8 lg:grid-cols-[minmax(0,1fr)_280px]">
-        <section className="space-y-4">
-          <div className="min-h-80 space-y-4 rounded-2xl border bg-white p-5 shadow-sm">
+      <div className="mx-auto grid min-h-0 w-full max-w-6xl flex-1 grid-rows-[minmax(0,1fr)_minmax(0,0.45fr)] gap-6 overflow-hidden px-5 py-8 lg:grid-cols-[minmax(0,1fr)_280px] lg:grid-rows-1">
+        <section className="flex min-h-0 flex-col gap-4">
+          <KnowledgeBaseUploadStatus status={uploadStatus} />
+          <div className="min-h-0 flex-1 space-y-4 overflow-y-auto rounded-2xl border bg-white p-5 shadow-sm">
             <KnowledgeBaseChat
               messages={messages}
               onOpenCitation={setCitation}
