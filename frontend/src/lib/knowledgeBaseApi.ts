@@ -50,10 +50,61 @@ export interface UploadResult {
 
 export interface UploadOptions {
   signal?: AbortSignal;
+  existingUploadId?: string;
   onProgress?: (progress: UploadProgress) => void;
+  onUploadId?: (uploadId: string) => void;
 }
 
 const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:4000";
+const MAX_RETRIES = 3;
+const RETRY_BASE_DELAY_MS = 1_000;
+
+function isAbortError(cause: unknown): boolean {
+  return cause instanceof DOMException && cause.name === "AbortError";
+}
+
+function isRetryableStatus(status: number): boolean {
+  return status === 408 || status === 429 || status >= 500;
+}
+
+function waitForRetry(delayMs: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new DOMException("Aborted", "AbortError"));
+      return;
+    }
+
+    const handleAbort = () => {
+      window.clearTimeout(timeout);
+      reject(new DOMException("Aborted", "AbortError"));
+    };
+    const timeout = window.setTimeout(() => {
+      signal?.removeEventListener("abort", handleAbort);
+      resolve();
+    }, delayMs);
+    signal?.addEventListener("abort", handleAbort, { once: true });
+  });
+}
+
+async function fetchWithRetry(
+  input: RequestInfo | URL,
+  init: RequestInit = {},
+): Promise<Response> {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      const response = await fetch(input, init);
+      if (!isRetryableStatus(response.status) || attempt >= MAX_RETRIES) {
+        return response;
+      }
+    } catch (cause) {
+      if (isAbortError(cause) || attempt >= MAX_RETRIES) throw cause;
+    }
+
+    const exponentialDelay = RETRY_BASE_DELAY_MS * (2 ** attempt);
+    const jitter = Math.floor(Math.random() * 250);
+    await waitForRetry(exponentialDelay + jitter, init.signal ?? undefined);
+  }
+}
 
 async function readError(response: Response): Promise<string> {
   try {
@@ -75,7 +126,7 @@ export async function uploadKnowledgeBaseDocument(
   file: File,
   options: UploadOptions = {},
 ): Promise<UploadResult> {
-  const { onProgress, signal } = options;
+  const { existingUploadId, onProgress, onUploadId, signal } = options;
   onProgress?.({ phase: "hashing", progress: 0 });
   const buffer = await file.arrayBuffer();
   const hashBuffer = await crypto.subtle.digest("SHA-256", buffer);
@@ -85,10 +136,16 @@ export async function uploadKnowledgeBaseDocument(
   onProgress?.({ phase: "hashing", progress: 100 });
 
   const chunkSize = 5 * 1024 * 1024;
-  const initResponse = await fetch(`${backendUrl}/upload/init`, {
+  const initResponse = await fetchWithRetry(`${backendUrl}/upload/init`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ fileName: file.name, fileSize: file.size, hash, chunkSize }),
+    body: JSON.stringify({
+      fileName: file.name,
+      fileSize: file.size,
+      hash,
+      chunkSize,
+      ...(existingUploadId ? { existingUploadId } : {}),
+    }),
     signal,
   });
   if (!initResponse.ok) throw new Error(await readError(initResponse));
@@ -104,6 +161,7 @@ export async function uploadKnowledgeBaseDocument(
     };
   }
 
+  onUploadId?.(init.uploadId);
   const uploaded = new Set(init.uploadedChunks);
   const reportUploadProgress = () => {
     onProgress?.({
@@ -115,7 +173,7 @@ export async function uploadKnowledgeBaseDocument(
   for (let index = 0; index < init.totalChunks; index += 1) {
     if (uploaded.has(index)) continue;
     const start = index * init.chunkSize;
-    const response = await fetch(
+    const response = await fetchWithRetry(
       `${backendUrl}/upload/chunk?uploadId=${encodeURIComponent(init.uploadId)}&index=${index}`,
       {
         method: "PUT",
@@ -129,7 +187,7 @@ export async function uploadKnowledgeBaseDocument(
     reportUploadProgress();
   }
 
-  const completeResponse = await fetch(`${backendUrl}/upload/complete`, {
+  const completeResponse = await fetchWithRetry(`${backendUrl}/upload/complete`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ uploadId: init.uploadId }),

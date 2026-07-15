@@ -13,6 +13,11 @@ export interface UploadMetadata {
   receivedChunks: number[];
   tempDir: string;
   createdAt: string;
+  completedResult?: {
+    taskId: string;
+    documentId?: string;
+    dedup?: boolean;
+  };
 }
 
 export interface UploadIndexEntry {

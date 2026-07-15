@@ -16,10 +16,12 @@ export interface UploadStatus {
   error?: string;
   stage?: IngestionStage;
   deduplicated?: boolean;
+  resumable?: boolean;
 }
 
 interface KnowledgeBaseUploadStatusProps {
   status: UploadStatus | null;
+  onResume?: () => void;
 }
 
 const stageLabels: Record<IngestionStage, string> = {
@@ -35,6 +37,7 @@ const stageLabels: Record<IngestionStage, string> = {
 
 export function KnowledgeBaseUploadStatus({
   status,
+  onResume,
 }: KnowledgeBaseUploadStatusProps) {
   if (!status) return null;
 
@@ -83,6 +86,15 @@ export function KnowledgeBaseUploadStatus({
             style={{ width: `${Math.max(0, Math.min(100, status.progress))}%` }}
           />
         </div>
+      ) : null}
+      {isFailed && status.resumable && onResume ? (
+        <button
+          type="button"
+          onClick={onResume}
+          className="mt-3 rounded-lg bg-red-700 px-3 py-1.5 text-xs font-semibold text-white hover:bg-red-800"
+        >
+          继续上传
+        </button>
       ) : null}
       {status.taskId ? (
         <p className="mt-1 text-[11px] opacity-60">任务：{status.taskId.slice(0, 8)}</p>

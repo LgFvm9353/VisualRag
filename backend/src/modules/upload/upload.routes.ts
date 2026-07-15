@@ -133,6 +133,15 @@ export const uploadRoutes: FastifyPluginAsync<UploadPluginOptions> = async (
     let metadata: Awaited<ReturnType<typeof loadUploadMetadata>> = null;
     if (existingId) {
       metadata = await withUploadLock(existingId, () => loadUploadMetadata(existingId));
+      if (metadata && (
+        metadata.fileName !== body.fileName
+        || metadata.fileSize !== body.fileSize
+        || metadata.hash !== body.hash
+        || metadata.chunkSize !== body.chunkSize
+      )) {
+        reply.code(409).send({ error: "upload_metadata_mismatch" });
+        return;
+      }
     }
 
     if (!metadata) {
@@ -213,6 +222,10 @@ export const uploadRoutes: FastifyPluginAsync<UploadPluginOptions> = async (
       reply.code(404).send({ error: "upload_not_found" });
       return;
     }
+    if (metadata.completedResult) {
+      reply.send(metadata.completedResult);
+      return;
+    }
     if (metadata.receivedChunks.length !== metadata.totalChunks) {
       reply.code(400).send({ error: "chunks_incomplete" });
       return;
@@ -285,23 +298,30 @@ export const uploadRoutes: FastifyPluginAsync<UploadPluginOptions> = async (
       return { taskId: task.id, documentId: null as string | null, sourcePath: null as string | null, skipped: false };
     });
 
-    // 清理上传临时文件（锁外操作）
-    const chunksRootDir = getChunksRootDir();
-    const metaPath = join(chunksRootDir, `${metadata.id}.json`);
+    // 清理上传临时分片，保留完成结果元数据以支持完成请求安全重试；
+    // 元数据由现有的过期上传清理任务统一回收。
     await fs.rm(metadata.tempDir, { recursive: true, force: true }).catch(() => {});
-    await fs.unlink(metaPath).catch(() => {});
 
-    if (result.skipped) {
-      const task = opts.pipeline.createCompletedTask({
-        documentId: result.documentId!,
-        fileName: metadata.fileName,
-        sourcePath: result.sourcePath!,
-        fileType: detectFileType(metadata.fileName),
-      });
-      reply.send({ taskId: task.id, documentId: result.documentId!, dedup: true });
-    } else {
-      reply.send({ taskId: result.taskId! });
-    }
+    const completedResult = result.skipped
+      ? {
+          taskId: opts.pipeline.createCompletedTask({
+            documentId: result.documentId!,
+            fileName: metadata.fileName,
+            sourcePath: result.sourcePath!,
+            fileType: detectFileType(metadata.fileName),
+          }).id,
+          documentId: result.documentId!,
+          dedup: true,
+        }
+      : { taskId: result.taskId! };
+
+    await withUploadLock(metadata.id, async () => {
+      const current = await loadUploadMetadata(metadata.id);
+      if (!current) return;
+      current.completedResult = completedResult;
+      await saveUploadMetadata(current);
+    });
+    reply.send(completedResult);
   });
 
   // ---- GET /tasks/:id ----

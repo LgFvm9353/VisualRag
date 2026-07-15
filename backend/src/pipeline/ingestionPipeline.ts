@@ -10,12 +10,10 @@ import type {
   ExtractedDocumentMetadata,
 } from "./types.js";
 import { ProgressEmitter } from "./progressEmitter.js";
-import { extractTextFromPdf } from "../pdf/textExtractor.js";
+import { ParserRegistry, createDefaultParserRegistry } from "../document-parsing/parserRegistry.js";
+import { toLegacyDocxParagraphs, toLegacyLayoutPages, toLegacyTextPages } from "../document-parsing/legacyAdapter.js";
 import { prisma } from "../db/prisma.js";
-import { analyzePdfLayout } from "../pdf/layoutAnalyzer.js";
 import {
-  extractTextFromDocx,
-  toTextPages,
   type DocxParagraph,
 } from "../docx/textExtractor.js";
 import { extractTextPagesFromHtml, extractTextPagesFromPlainText } from "../text/textExtractor.js";
@@ -49,7 +47,10 @@ export class IngestionPipeline {
   private openai: OpenAI;
   private embeddingModel: string;
 
-  constructor(progressEmitter: ProgressEmitter) {
+  constructor(
+    progressEmitter: ProgressEmitter,
+    private readonly parserRegistry: ParserRegistry = createDefaultParserRegistry(),
+  ) {
     this.progressEmitter = progressEmitter;
     this.openai = new OpenAI({
       baseURL: process.env.OPENAI_BASE_URL,
@@ -225,6 +226,14 @@ export class IngestionPipeline {
       this.updateTaskStage(task, "completed", 100);
     } catch (err) {
       task.error = err instanceof Error ? err.message : String(err);
+      try {
+        await prisma.document.updateMany({
+          where: { id: task.id },
+          data: { status: "failed" },
+        });
+      } catch (statusError) {
+        console.error("failed to persist document failure status", statusError);
+      }
       this.updateTaskStage(task, "failed", task.progress);
     }
   }
@@ -239,12 +248,19 @@ export class IngestionPipeline {
 
   private async extractText(task: IngestionTask) {
     if (task.fileType === "docx") {
-      const result = await extractTextFromDocx(task.sourcePath);
+      const parser = this.parserRegistry.get("application/vnd.openxmlformats-officedocument.wordprocessingml.document");
+      if (!parser) throw new Error("parser_not_registered: docx");
+      const parsed = await parser.parse({ filePath: task.sourcePath, documentId: task.id });
+      if (parsed.blocks.length === 0) {
+        throw new Error("document_parse_empty: docx parser produced no blocks");
+      }
       task.meta = {
         ...(task.meta || {}),
-        textPages: toTextPages(result.paragraphs),
-        docxParagraphs: result.paragraphs,
-        docxHtml: result.html,
+        parsedDocument: parsed,
+        textPages: toLegacyTextPages(parsed),
+        docxParagraphs: toLegacyDocxParagraphs(parsed),
+        docxHtml: parsed.artifacts.html,
+        parseWarnings: parsed.warnings,
       };
       this.persistDocxHtml(task).catch((err) =>
         console.error("extractText persistDocxHtml failed:", err),
@@ -267,45 +283,45 @@ export class IngestionPipeline {
         ...(task.meta || {}),
         textPages: result.pages,
       };
-    } else {
-      const result = await extractTextFromPdf(task.sourcePath);
+    } else if (task.fileType === "pdf") {
+      const parser = this.parserRegistry.get("application/pdf");
+      if (!parser) throw new Error("parser_not_registered: pdf");
+      const parsed = await parser.parse({ filePath: task.sourcePath, documentId: task.id });
+      const missingOcrPages = parsed.warnings
+        .filter((warning) => warning.code === "ocr_required")
+        .map((warning) => warning.locator?.pageNumber)
+        .filter((pageNumber): pageNumber is number => pageNumber !== undefined)
+        .filter((pageNumber) => !parsed.blocks.some((block) => block.locator.pageNumber === pageNumber && block.text.trim()));
+      if (missingOcrPages.length > 0) {
+        throw new Error(`ocr_required: missing pages=${missingOcrPages.join(",")}`);
+      }
+      if (parsed.blocks.length === 0) {
+        throw new Error("document_parse_empty: pdf parser produced no blocks");
+      }
       task.meta = {
         ...(task.meta || {}),
-        textPages: result.pages,
+        parsedDocument: parsed,
+        textPages: toLegacyTextPages(parsed),
+        layoutPages: toLegacyLayoutPages(parsed, task.id),
+        parseWarnings: parsed.warnings,
       };
+    } else {
+      throw new Error(`unsupported_file_type: ${task.fileType}`);
+    }
+    const extractedPages = (task.meta as any)?.textPages as { text?: string }[] | undefined;
+    if (!extractedPages?.some((page) => page.text?.trim())) {
+      throw new Error(`document_parse_empty: ${task.fileType} produced no usable text`);
     }
     this.tasks.set(task.id, task);
   }
 
   private async layoutAnalysis(task: IngestionTask) {
-    const textPages = (task.meta as any)?.textPages as
-      | { pageNumber: number; width: number; height: number; text: string }[]
-      | undefined;
-    if (!textPages || textPages.length === 0) {
-      return;
-    }
-    const layoutPages: LayoutPage[] = await analyzePdfLayout(
-      task.sourcePath,
-      task.id
-    );
-    task.meta = {
-      ...(task.meta || {}),
-      layoutPages,
-    };
+    // PDF layout is produced by PdfDocumentParser during the single parse pass.
     this.tasks.set(task.id, task);
   }
 
-  private async generateTextEmbeddings(task: IngestionTask) {
-    const textPages = (task.meta as any)?.textPages as
-      | { pageNumber: number; width: number; height: number; text: string }[]
-      | undefined;
-    if (!textPages || textPages.length === 0) {
-      return;
-    }
-
-    // 文本 embedding 已切换为基于 chunk 的主链生成，
-    // 此阶段仅保留进度占位，避免继续对整页/整段做重复 embedding。
-    await this.simulateWork(task, "generating_text_embeddings");
+  private async generateTextEmbeddings(_task: IngestionTask) {
+    // 真实文本向量在 writeDatabase 中按已落库 chunk 生成；此阶段不伪造进度。
   }
 
   private async generateImageEmbeddings(task: IngestionTask) {
@@ -315,7 +331,13 @@ export class IngestionPipeline {
     }
     const endpoint = process.env.IMAGE_EMBEDDING_ENDPOINT;
     if (!endpoint) {
-      await this.simulateWork(task, "generating_image_embeddings");
+      const warning = "image_embedding_degraded: IMAGE_EMBEDDING_ENDPOINT is not configured";
+      task.meta = {
+        ...(task.meta || {}),
+        ingestionWarnings: [...((task.meta as any)?.ingestionWarnings ?? []), warning],
+      };
+      console.warn(warning);
+      this.tasks.set(task.id, task);
       return;
     }
     const regions: {
@@ -402,8 +424,27 @@ export class IngestionPipeline {
       | undefined;
     const layoutPages = (task.meta as any)?.layoutPages as LayoutPage[] | undefined;
 
-    if (!textPages || textPages.length === 0) {
-      return;
+    const parsedDocument = (task.meta as any)?.parsedDocument as import("../document-parsing/types.js").ParsedDocument | undefined;
+    const sectionInputs = parsedDocument?.blocks.length
+      ? parsedDocument.blocks.map((block, index) => ({
+          index: block.locator.paragraphIndex ?? block.locator.blockIndex ?? index,
+          pageNumber: block.locator.pageNumber ?? null,
+          width: undefined as number | undefined,
+          height: undefined as number | undefined,
+          text: block.text,
+          block,
+        }))
+      : (textPages ?? []).map((page) => ({
+          index: page.pageNumber,
+          pageNumber: page.pageNumber,
+          width: page.width,
+          height: page.height,
+          text: page.text,
+          block: undefined,
+        }));
+
+    if (sectionInputs.length === 0) {
+      throw new Error("document_has_no_content");
     }
 
     const isDocx = task.fileType === "docx";
@@ -436,11 +477,12 @@ export class IngestionPipeline {
       pageNumber?: number | null;
       content: string;
       title?: string | null;
+      blocks?: { kind: import("../document-parsing/types.js").DocumentBlockKind; text: string }[];
     }[] = [];
     let skippedShortCount = 0;
 
-    for (let i = 0; i < textPages.length; i++) {
-      const page = textPages[i];
+    for (let i = 0; i < sectionInputs.length; i++) {
+      const page = sectionInputs[i];
       const cleanedText = sanitizePostgresText(page.text);
 
       if (cleanedText.length < MIN_CONTENT_LENGTH) {
@@ -452,17 +494,26 @@ export class IngestionPipeline {
 
       const sectionData: Record<string, unknown> = {
         documentId: task.id,
-        index: page.pageNumber,
+        index: page.index,
         content: cleanedText,
         sourceType: task.fileType,
       };
 
-      if (isDocx || isSectionBasedText) {
+      if (page.block) {
+        sectionData.pageNumber = page.block.locator.pageNumber ?? null;
+        sectionData.pageWidth = layout?.width ?? null;
+        sectionData.pageHeight = layout?.height ?? null;
+        sectionData.headingLevel = page.block.headingLevel ?? null;
+        sectionData.parentId = null;
+        sectionData.title = page.block.kind === "heading"
+          ? cleanedText.slice(0, 120)
+          : page.block.locator.sectionPath?.at(-1) ?? null;
+      } else if (isDocx || isSectionBasedText) {
         sectionData.pageNumber = null;
         sectionData.pageWidth = null;
         sectionData.pageHeight = null;
         sectionData.headingLevel = docxPara?.headingLevel ?? null;
-        sectionData.parentId = docxPara?.parentIndex?.toString() ?? null;
+        sectionData.parentId = null;
         sectionData.title = docxPara?.headingLevel ? cleanedText.slice(0, 120) : null;
       } else {
         sectionData.pageNumber = page.pageNumber;
@@ -479,6 +530,7 @@ export class IngestionPipeline {
         pageNumber: section.pageNumber,
         content: cleanedText,
         title: section.title ?? null,
+        blocks: page.block ? [{ kind: page.block.kind, text: cleanedText }] : undefined,
       });
     }
 
@@ -497,6 +549,9 @@ export class IngestionPipeline {
     });
 
     // 4. 为真实 chunk 生成向量，建立检索主链
+    if (chunks.length === 0) {
+      throw new Error("document_has_no_chunks");
+    }
     await this.createChunkEmbeddings(task, chunks);
 
     // 5. 标记处理完成
@@ -507,8 +562,11 @@ export class IngestionPipeline {
   }
 
   private async createChunkEmbeddings(task: IngestionTask, chunks: ChunkRecord[]) {
-    if (!process.env.OPENAI_API_KEY || chunks.length === 0) {
-      return;
+    if (!process.env.OPENAI_API_KEY) {
+      throw new Error("embedding_not_configured: OPENAI_API_KEY is required");
+    }
+    if (chunks.length === 0) {
+      throw new Error("document_has_no_chunks");
     }
 
     const total = chunks.length;
@@ -520,13 +578,14 @@ export class IngestionPipeline {
         input,
       });
       const embedding = response.data[0]?.embedding ?? [];
-      if (embedding.length > 0) {
-        const embeddingLiteral = `[${embedding.join(",")}]`;
-        await prisma.$executeRaw`
-          INSERT INTO "ChunkEmbedding" ("id", "chunkId", "documentId", "embedding")
-          VALUES (${randomUUID()}, ${chunk.id}, ${task.id}, ${embeddingLiteral}::vector)
-        `;
+      if (embedding.length === 0) {
+        throw new Error(`chunk_embedding_missing: chunkId=${chunk.id}`);
       }
+      const embeddingLiteral = `[${embedding.join(",")}]`;
+      await prisma.$executeRaw`
+        INSERT INTO "ChunkEmbedding" ("id", "chunkId", "documentId", "embedding")
+        VALUES (${randomUUID()}, ${chunk.id}, ${task.id}, ${embeddingLiteral}::vector)
+      `;
 
       const baseProgress = this.stageBaseProgress("writing_database", task);
       const stageSpan = (task.meta as any)?._stageSpan ?? 15;

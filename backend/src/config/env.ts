@@ -13,6 +13,10 @@ const envSchema = z.object({
   JWT_SECRET: z.string().min(16).default("change-me-in-production-use-a-strong-secret"),
   IMAGE_EMBEDDING_ENDPOINT: z.string().url().optional(),
   IMAGE_EMBEDDING_API_KEY: z.string().optional(),
+  OCR_ENDPOINT: z.string().url().optional(),
+  OCR_API_KEY: z.string().optional(),
+  OCR_TIMEOUT_MS: z.coerce.number().int().positive().default(120000),
+  OCR_MAX_RETRIES: z.coerce.number().int().min(0).max(5).default(2),
 });
 
 export type Env = z.infer<typeof envSchema>;
@@ -54,6 +58,17 @@ export const config = {
   get chat() {
     const env = getEnv();
     return { model: env.OPENAI_CHAT_MODEL, baseURL: env.OPENAI_BASE_URL, apiKey: env.OPENAI_API_KEY };
+  },
+
+  get ocr() {
+    const env = getEnv();
+    if (!env.OCR_ENDPOINT) return undefined;
+    return {
+      endpoint: env.OCR_ENDPOINT,
+      apiKey: env.OCR_API_KEY,
+      timeoutMs: env.OCR_TIMEOUT_MS,
+      maxRetries: env.OCR_MAX_RETRIES,
+    };
   },
 
   get chunking() {

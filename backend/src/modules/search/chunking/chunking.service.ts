@@ -12,7 +12,13 @@ import type { PrismaClient } from "@prisma/client";
 import OpenAI from "openai";
 import { config } from "../../../config/env.js";
 import { logger } from "../../../lib/logger.js";
-import { recursiveChunk, type ChunkResult } from "./strategies/recursive-chunker.js";
+import {
+  buildStructuralChunks,
+  mapParentChildIndexes,
+  propagateSectionContexts,
+} from "./structural-chunking.js";
+import type { DocumentBlockKind } from "../../../document-parsing/types.js";
+import type { ChunkResult } from "./strategies/recursive-chunker.js";
 
 export interface ChunkRecord {
   id: string;
@@ -69,7 +75,13 @@ export class ChunkingService {
    */
   async chunkDocument(
     documentId: string,
-    sections: { id: string; pageNumber?: number | null; content: string; title?: string | null }[],
+    sections: {
+      id: string;
+      pageNumber?: number | null;
+      content: string;
+      title?: string | null;
+      blocks?: { kind: DocumentBlockKind; text: string }[];
+    }[],
     options?: {
       skipContextualRetrieval?: boolean;
       chunkSize?: number;
@@ -84,8 +96,10 @@ export class ChunkingService {
     const allChunks: (ChunkResult & { sectionId: string; pageNumber?: number | null })[] = [];
 
     for (const section of sections) {
-      let baseOffset = 0;
-      const sectionChunks = recursiveChunk(section.content, baseOffset, {
+      const structuralBlocks = section.blocks?.length
+        ? section.blocks
+        : [{ kind: "paragraph" as const, text: section.content }];
+      const sectionChunks = buildStructuralChunks(structuralBlocks, {
         chunkSize,
         chunkOverlap,
       });
@@ -145,17 +159,9 @@ export class ChunkingService {
 
     // 写入 Parent Context
     const contextRecords: ChunkContextRecord[] = [];
-    const contextChunkMapping: string[][] = parentContexts.map((pc) => {
-      // 找出该 parent context 包含哪些 child chunk
-      const childIds: string[] = [];
-      for (let i = 0; i < allChunks.length; i++) {
-        const c = allChunks[i];
-        if (c.startOffset >= pc.startOffset && c.endOffset <= pc.endOffset) {
-          childIds.push(chunkIds[i]);
-        }
-      }
-      return childIds;
-    });
+    const contextChunkMapping: string[][] = parentContexts.map((parent) =>
+      mapParentChildIndexes(allChunks, parent).map((index) => chunkIds[index]),
+    );
 
     for (let i = 0; i < parentContexts.length; i++) {
       const pc = parentContexts[i];
@@ -220,16 +226,7 @@ export class ChunkingService {
       }
     }
 
-    // 将采样结果扩散到相邻 chunk
-    const result: (string | null)[] = [];
-    let lastContext: string | null = null;
-    for (let i = 0; i < chunks.length; i++) {
-      if (sampledResults.has(i)) {
-        lastContext = sampledResults.get(i)!;
-      }
-      result.push(lastContext);
-    }
-    return result;
+    return propagateSectionContexts(chunks, sampledResults);
   }
 
   /**

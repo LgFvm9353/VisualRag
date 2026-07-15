@@ -30,6 +30,10 @@ export default function HomePage() {
   const [loading, setLoading] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [uploadStatus, setUploadStatus] = useState<UploadStatus | null>(null);
+  const [resumableUpload, setResumableUpload] = useState<{
+    file: File;
+    uploadId?: string;
+  } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const uploadAbortRef = useRef<AbortController | null>(null);
@@ -142,10 +146,15 @@ export default function HomePage() {
     }
   }
 
-  async function handleUpload(file: File) {
+  async function handleUpload(file: File, existingUploadId?: string) {
     uploadAbortRef.current?.abort();
     const controller = new AbortController();
+    let currentUploadId = existingUploadId;
+    let lastUploadProgress = 0;
+    let uploadCompleted = false;
+
     uploadAbortRef.current = controller;
+    setResumableUpload({ file, uploadId: existingUploadId });
     setUploading(true);
     setError(null);
     setUploadStatus({
@@ -158,7 +167,13 @@ export default function HomePage() {
     try {
       const result = await uploadKnowledgeBaseDocument(file, {
         signal: controller.signal,
+        existingUploadId,
+        onUploadId: (uploadId) => {
+          currentUploadId = uploadId;
+          setResumableUpload({ file, uploadId });
+        },
         onProgress: ({ phase, progress }) => {
+          if (phase === "uploading") lastUploadProgress = progress;
           setUploadStatus({
             fileName: file.name,
             state: phase,
@@ -168,6 +183,8 @@ export default function HomePage() {
           });
         },
       });
+      uploadCompleted = true;
+      setResumableUpload(null);
 
       if (result.deduplicated) {
         setUploadStatus({
@@ -225,12 +242,16 @@ export default function HomePage() {
     } catch (cause) {
       if (cause instanceof DOMException && cause.name === "AbortError") return;
       const message = cause instanceof Error ? cause.message : "upload_failed";
+      if (!uploadCompleted) {
+        setResumableUpload({ file, uploadId: currentUploadId });
+      }
       setUploadStatus({
         fileName: file.name,
         state: "failed",
-        progress: 0,
-        message: "文档上传或处理失败",
+        progress: uploadCompleted ? 100 : lastUploadProgress,
+        message: uploadCompleted ? "文档处理失败" : "文档上传已暂停",
         error: message,
+        resumable: !uploadCompleted,
       });
       setError(message);
     } finally {
@@ -251,7 +272,10 @@ export default function HomePage() {
         accept=".pdf,.docx,.pptx,.txt,.md,.html,.htm"
         onChange={(event) => {
           const file = event.target.files?.[0];
-          if (file) void handleUpload(file);
+          if (file) {
+            setResumableUpload(null);
+            void handleUpload(file);
+          }
         }}
       />
       <header className="shrink-0 border-b border-slate-200 bg-white">
@@ -274,7 +298,12 @@ export default function HomePage() {
       </header>
       <div className="mx-auto grid min-h-0 w-full max-w-6xl flex-1 grid-rows-[minmax(0,1fr)_minmax(0,0.45fr)] gap-6 overflow-hidden px-5 py-8 lg:grid-cols-[minmax(0,1fr)_280px] lg:grid-rows-1">
         <section className="flex min-h-0 flex-col gap-4">
-          <KnowledgeBaseUploadStatus status={uploadStatus} />
+          <KnowledgeBaseUploadStatus
+            status={uploadStatus}
+            onResume={resumableUpload && !uploading
+              ? () => void handleUpload(resumableUpload.file, resumableUpload.uploadId)
+              : undefined}
+          />
           <div className="min-h-0 flex-1 space-y-4 overflow-y-auto rounded-2xl border bg-white p-5 shadow-sm">
             <KnowledgeBaseChat
               messages={messages}
