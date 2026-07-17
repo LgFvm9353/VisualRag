@@ -27,6 +27,12 @@ export interface UploadIndexEntry {
 
 export type UploadIndex = Record<string, UploadIndexEntry>;
 
+export function shouldReuseCompletedResult(
+  task: { stage: string } | undefined,
+): boolean {
+  return task !== undefined && task.stage !== "failed";
+}
+
 const uploadLocks = new Map<string, Promise<void>>();
 
 /** 专门用于 upload-index.json 的锁 key */

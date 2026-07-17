@@ -18,8 +18,10 @@ import {
   getChunksRootDir,
   writeChunk,
   assembleFile,
+  shouldReuseCompletedResult,
 } from "./upload.service.js";
 import { resolveDocumentSourcePath } from "./source-path.js";
+import { claimDocument } from "./document-claim.service.js";
 
 /** 验证去重条目对应的 DB 文档是否已处理完成 */
 async function isDocumentReady(
@@ -90,7 +92,14 @@ export const uploadRoutes: FastifyPluginAsync<UploadPluginOptions> = async (
     await fs.mkdir(getChunksRootDir(), { recursive: true });
 
     const index = await loadUploadIndex();
-    const existing = index[body.hash];
+    const indexed = index[body.hash];
+    const databaseDocument = await opts.prisma.document.findUnique({
+      where: { contentHash: body.hash },
+      select: { id: true, status: true },
+    });
+    const existing = indexed ?? (databaseDocument
+      ? { documentId: databaseDocument.id, sourcePath: join(getUploadsDir(), body.hash) }
+      : undefined);
     if (existing?.sourcePath && existing?.documentId) {
       // 验证 DB 中文档确实已完成处理（防止上次管道失败的残留条目）
       const ready = await isDocumentReady(opts.prisma, existing.documentId);
@@ -223,8 +232,17 @@ export const uploadRoutes: FastifyPluginAsync<UploadPluginOptions> = async (
       return;
     }
     if (metadata.completedResult) {
-      reply.send(metadata.completedResult);
-      return;
+      const cachedTask = opts.pipeline.getTask(metadata.completedResult.taskId);
+      if (shouldReuseCompletedResult(cachedTask)) {
+        reply.send(metadata.completedResult);
+        return;
+      }
+      await withUploadLock(metadata.id, async () => {
+        const current = await loadUploadMetadata(metadata.id);
+        if (!current) return;
+        delete current.completedResult;
+        await saveUploadMetadata(current);
+      });
     }
     if (metadata.receivedChunks.length !== metadata.totalChunks) {
       reply.code(400).send({ error: "chunks_incomplete" });
@@ -283,17 +301,36 @@ export const uploadRoutes: FastifyPluginAsync<UploadPluginOptions> = async (
         }
       }
 
-      // 创建处理任务
+      // 数据库唯一 contentHash 是最终幂等防线；本地 index 仅作为路径缓存。
+      const candidateDocumentId = randomUUID();
+      const claim = await claimDocument(opts.prisma, {
+        id: candidateDocumentId,
+        contentHash: metadata.hash,
+        fileName: metadata.fileName,
+        fileType: detectFileType(metadata.fileName),
+      });
+
+      index[metadata.hash] = { sourcePath: finalPath, documentId: claim.document.id };
+      await saveUploadIndex(index);
+
+      if (claim.action === "ready") {
+        return {
+          taskId: null as string | null,
+          documentId: claim.document.id,
+          sourcePath: finalPath,
+          skipped: true,
+        };
+      }
+
+      // 只有哈希认领者或需要恢复的既有文档才进入处理管道。
       const fileType = detectFileType(metadata.fileName);
       const task = opts.pipeline.createTask({
+        documentId: claim.document.id,
+        contentHash: metadata.hash,
         fileName: metadata.fileName,
         fileType,
         sourcePath: finalPath,
       });
-
-      // 写入 index（documentId = task.id，pipeline 里会用 task.id 作为 document.id）
-      index[metadata.hash] = { sourcePath: finalPath, documentId: task.id };
-      await saveUploadIndex(index);
 
       return { taskId: task.id, documentId: null as string | null, sourcePath: null as string | null, skipped: false };
     });

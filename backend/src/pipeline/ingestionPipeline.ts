@@ -63,13 +63,19 @@ export class IngestionPipeline {
   }
 
   createTask(params: {
+    documentId: string;
+    contentHash: string;
     fileName: string;
     fileType: "pdf" | "docx" | "text" | "html" | "pptx" | "image" | "zip";
     sourcePath: string;
   }): IngestionTask {
+    const existing = this.tasks.get(params.documentId);
+    if (existing && existing.stage !== "failed") return existing;
+
     const now = new Date();
     const task: IngestionTask = {
-      id: randomUUID(),
+      id: params.documentId,
+      contentHash: params.contentHash,
       fileName: params.fileName,
       fileType: params.fileType,
       sourcePath: params.sourcePath,
@@ -454,11 +460,11 @@ export class IngestionPipeline {
       | DocxParagraph[]
       | undefined;
 
-    // 1. 创建 Document 记录
+    // Document 已在上传完成时按内容哈希原子认领，这里只更新提取出的元数据。
     const metadata = buildExtractedDocumentMetadata(task.fileName, task.fileType);
-    await prisma.document.create({
+    await prisma.document.update({
+      where: { id: task.id },
       data: {
-        id: task.id,
         fileName: task.fileName,
         fileType: task.fileType,
         status: "processing",

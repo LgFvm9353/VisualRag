@@ -13,8 +13,13 @@ const envSchema = z.object({
   JWT_SECRET: z.string().min(16).default("change-me-in-production-use-a-strong-secret"),
   IMAGE_EMBEDDING_ENDPOINT: z.string().url().optional(),
   IMAGE_EMBEDDING_API_KEY: z.string().optional(),
+  OCR_PROVIDER: z.enum(["http", "aliyun"]).optional(),
   OCR_ENDPOINT: z.string().url().optional(),
   OCR_API_KEY: z.string().optional(),
+  ALIYUN_OCR_ACCESS_KEY_ID: z.string().min(1).optional(),
+  ALIYUN_OCR_ACCESS_KEY_SECRET: z.string().min(1).optional(),
+  ALIYUN_OCR_ENDPOINT: z.string().min(1).default("ocr-api.cn-hangzhou.aliyuncs.com"),
+  ALIYUN_OCR_REGION_ID: z.string().min(1).default("cn-hangzhou"),
   OCR_TIMEOUT_MS: z.coerce.number().int().positive().default(120000),
   OCR_MAX_RETRIES: z.coerce.number().int().min(0).max(5).default(2),
 });
@@ -62,13 +67,30 @@ export const config = {
 
   get ocr() {
     const env = getEnv();
-    if (!env.OCR_ENDPOINT) return undefined;
+    const provider = env.OCR_PROVIDER ?? (env.OCR_ENDPOINT ? "http" : undefined);
+    if (!provider) return undefined;
+    if (provider === "http") {
+      if (!env.OCR_ENDPOINT) throw new Error("OCR_PROVIDER=http 时必须配置 OCR_ENDPOINT");
+      return {
+        provider,
+        endpoint: env.OCR_ENDPOINT,
+        apiKey: env.OCR_API_KEY,
+        timeoutMs: env.OCR_TIMEOUT_MS,
+        maxRetries: env.OCR_MAX_RETRIES,
+      } as const;
+    }
+    if (!env.ALIYUN_OCR_ACCESS_KEY_ID || !env.ALIYUN_OCR_ACCESS_KEY_SECRET) {
+      throw new Error("OCR_PROVIDER=aliyun 时必须配置 ALIYUN_OCR_ACCESS_KEY_ID 和 ALIYUN_OCR_ACCESS_KEY_SECRET");
+    }
     return {
-      endpoint: env.OCR_ENDPOINT,
-      apiKey: env.OCR_API_KEY,
+      provider,
+      accessKeyId: env.ALIYUN_OCR_ACCESS_KEY_ID,
+      accessKeySecret: env.ALIYUN_OCR_ACCESS_KEY_SECRET,
+      endpoint: env.ALIYUN_OCR_ENDPOINT,
+      regionId: env.ALIYUN_OCR_REGION_ID,
       timeoutMs: env.OCR_TIMEOUT_MS,
       maxRetries: env.OCR_MAX_RETRIES,
-    };
+    } as const;
   },
 
   get chunking() {

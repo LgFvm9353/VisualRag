@@ -15,8 +15,9 @@ datasource db {
 
 model Document {
   id        String   @id @default(uuid())
-  fileName  String
-  fileType  String   @default("pdf") // "pdf" | "docx" | "pptx" | "text" | "html"
+  fileName    String
+  contentHash String   @unique
+  fileType    String   @default("pdf") // "pdf" | "docx" | "pptx" | "text" | "html"
   fileSize     Int?                    // 字节
   status       String   @default("processing") // "processing" | "ready" | "failed"
   sourceLabel  String?

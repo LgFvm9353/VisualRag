@@ -17,6 +17,7 @@ export type IngestionStage =
 
 export interface IngestionTask {
   id: string;
+  contentHash?: string;
   fileName: string;
   fileType: "pdf" | "docx" | "text" | "html" | "pptx" | "image" | "zip";
   sourcePath: string;
