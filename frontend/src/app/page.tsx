@@ -20,6 +20,11 @@ import {
   type KnowledgeBaseCitation,
   type KnowledgeBaseDocument,
 } from "@/lib/knowledgeBaseApi";
+import {
+  keepProgressMonotonic,
+  mapCompositeProgress,
+  type CompositeProgressPhase,
+} from "@/lib/uploadCompositeProgress";
 
 export default function HomePage() {
   const [documents, setDocuments] = useState<KnowledgeBaseDocument[]>([]);
@@ -150,8 +155,19 @@ export default function HomePage() {
     uploadAbortRef.current?.abort();
     const controller = new AbortController();
     let currentUploadId = existingUploadId;
-    let lastUploadProgress = 0;
+    let lastDisplayedProgress = 0;
     let uploadCompleted = false;
+
+    const getDisplayProgress = (
+      phase: CompositeProgressPhase,
+      localProgress: number,
+    ) => {
+      lastDisplayedProgress = keepProgressMonotonic(
+        lastDisplayedProgress,
+        mapCompositeProgress(phase, localProgress),
+      );
+      return lastDisplayedProgress;
+    };
 
     uploadAbortRef.current = controller;
     setResumableUpload({ file, uploadId: existingUploadId });
@@ -173,11 +189,10 @@ export default function HomePage() {
           setResumableUpload({ file, uploadId });
         },
         onProgress: ({ phase, progress }) => {
-          if (phase === "uploading") lastUploadProgress = progress;
           setUploadStatus({
             fileName: file.name,
             state: phase,
-            progress,
+            progress: getDisplayProgress(phase, progress),
             message:
               phase === "hashing" ? "正在计算文件指纹…" : "正在上传文件…",
           });
@@ -221,7 +236,7 @@ export default function HomePage() {
         setUploadStatus({
           fileName: file.name,
           state: "processing",
-          progress: task.progress,
+          progress: getDisplayProgress("processing", task.progress),
           message: "正在处理文档…",
           taskId: task.id,
           stage: task.stage,
@@ -248,7 +263,7 @@ export default function HomePage() {
       setUploadStatus({
         fileName: file.name,
         state: "failed",
-        progress: uploadCompleted ? 100 : lastUploadProgress,
+        progress: lastDisplayedProgress,
         message: uploadCompleted ? "文档处理失败" : "文档上传已暂停",
         error: message,
         resumable: !uploadCompleted,
